@@ -44,7 +44,9 @@ import time
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-FAST_GEN = ROOT / "platform" / "dreamcast" / "scripts" / "fast_gen.py"
+# The Dreamcast port's rewrite of the generated code (platform/dreamcast/
+# scripts/fast_gen.py), copied here so this port builds without that folder.
+FAST_GEN = HERE / "scripts" / "fast_gen.py"
 # The importer's images the game reads (StickRom's regions, the TGP tables,
 # the sound program and PCM ROMs for the native audio).
 ROM_FILES = ["program", "main_data", "polygons", "textures", "copro_data", "copro_tables",
@@ -194,8 +196,8 @@ def game(args):
     gen = gen_dir(args)
     out = host / "psp"
     # The i960 code with fewer lockstep checks and the TGP code with its
-    # count in a local: the Dreamcast's rewrite (platform/dreamcast/scripts/
-    # fast_gen.py), the same on any target; it rewrites only the files whose
+    # count in a local: the Dreamcast's rewrite (scripts/fast_gen.py, from
+    # platform/dreamcast), the same on any target; it rewrites only the files whose
     # output changes.
     fast = out / "gen_fast" / "daytona"
     fast_tgp = out / "gen_fast" / "daytona_tgp"
