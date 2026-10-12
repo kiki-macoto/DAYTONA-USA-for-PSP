@@ -1,0 +1,15 @@
+# The advanced course (20 cars, 4 laps), raced: Circuit Select follows the
+# wheel's position, so it is held right (0xc0) until the pedal has chosen
+# (course_advanced.txt lets it back to the centre first and races the
+# beginner oval).
+frames 6000
+1200-1209 coin=1
+1240-1249 coin=1
+1280-1289 coin=1
+1400-1409 start=1
+1560-1700 steer=0xc0
+1660-1679 accel=0xe0
+1701-1749 steer=0x80
+1820-1839 accel=0xe0
+1950-5999 accel=0xe0
+2150-5999 steer=0x98
