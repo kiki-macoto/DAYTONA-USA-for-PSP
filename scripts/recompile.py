@@ -104,7 +104,11 @@ def main():
          os.path.join(snd, "snd_gen.cpp")])
 
     run(["cmake", "-S", ".", "-B", build])  # picks up the generated sources
-    run(build_cmd + ["--parallel"])  # the game (daytona, m2run) and the check tools
+    # The game (daytona, m2run) and the check tools. --parallel without a
+    # number ignores CMAKE_BUILD_PARALLEL_LEVEL, and with Make it runs every
+    # compile at once (WSL ran out of memory): the variable's value, when set.
+    jobs = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL")
+    run(build_cmd + ["--parallel"] + ([jobs] if jobs else []))
 
 
 if __name__ == "__main__":
