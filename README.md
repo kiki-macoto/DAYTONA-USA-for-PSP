@@ -9,7 +9,7 @@
 エミュレーションを使わずに **PSP のネイティブコードとして動かす** 非公式の移植です。
 
 <!-- スクリーンショット（ROM 由来の画像なので、載せるかどうかは自分で判断してください） -->
-<img width="480" height="272" alt="download" src="https://github.com/user-attachments/assets/7c152217-cc77-43e6-b1f4-e62a24ac6afa" />
+　　　　　　<img width="480" height="272" alt="download" src="https://github.com/user-attachments/assets/7c152217-cc77-43e6-b1f4-e62a24ac6afa" />
 
 > [!IMPORTANT]
 > 一部AIを使用しています。
