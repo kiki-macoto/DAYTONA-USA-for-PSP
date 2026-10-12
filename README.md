@@ -1,4 +1,4 @@
-# Daytona USA static recompilation
+# DAYTONA USA for PSP
 
 Daytona USA (Sega Model 2) rebuilt as native code: the game's i960 program
 and the TGP program it uploads are statically recompiled to portable C++,
@@ -10,16 +10,6 @@ No game data is in this repository. You need your own ROM set (a
 MAME-format `.zip` or `.7z`): `daytona93` (Daytona USA Deluxe '93) or
 `daytona` (Revision A, 1994), or both.
 
-## Platforms
-
-| Platform | Status | Details |
-| --- | --- | --- |
-| Windows, macOS, Linux | The main build; setup below | [docs/getting-started.md](docs/getting-started.md) |
-| Android | Works (arm64), with on-screen touch controls or a Bluetooth or USB controller; tested on a device | [platform/mobile](platform/mobile/README.md) |
-| iOS | Works on iPhone, installed through Xcode or AltStore, with touch controls or a controller; tested on a device | [platform/mobile](platform/mobile/README.md) |
-| PS Vita | Works: a native Vita app (SDL2); with vitaGL about 57.3 frames/s (the arcade runs 57.52) at CPU 444 / GPU 166 MHz, no overclocking plugin; tested on a Vita | [platform/vita](platform/vita/README.md), release build: [HOW_TO_COMPILE_RELEASE.md](HOW_TO_COMPILE_RELEASE.md) |
-| Dreamcast | Runs in the Flycast emulator with sound and the controller, about 32 frames/s (the arcade runs 57.52); not yet on a console; in progress | [platform/dreamcast](platform/dreamcast/README.md) |
-| PSP (2000 and later) | Runs on a PSP-3000 (ARK-5, 333 MHz) with sound: a race at about 23 ms a frame for the arcade's 17.4, with fewer cars (20 / 10 / 10); a recorded race ends on the desktop's counts in PPSSPP; in progress | [platform/psp](platform/psp/README.md), build: [HOW_TO_COMPILE_PSP.md](HOW_TO_COMPILE_PSP.md) |
 
 Every port starts from the desktop setup: the game code is generated on a
 desktop computer from your ROM set, then built for the other platform.
