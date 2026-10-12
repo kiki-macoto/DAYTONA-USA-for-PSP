@@ -126,6 +126,7 @@ python3 platform/psp/build_psp.py game --overlay 画像.png
 - 透明な部分（または白い部分）がゲーム画面の位置になります
 - できた `overlay.bin` を `EBOOT.PBP` と同じフォルダに置くと表示され、消すと元に戻ります
 - PNG のみ対応です
+- おまけで、実機風のオーバーレイがリポジトリにあらかじめ含まれています。
 
 ## 不具合の報告
 
@@ -143,8 +144,8 @@ Daytona USA および SEGA は株式会社セガの商標です。
 
 ## クレジット
 
-- 元のプロジェクト：<元のリポジトリ名>（<作者名> and contributors）
-- PSP 移植：<あなたの名前>
+- 元のプロジェクト：[daytona-arcade-recomp](https://github.com/alphanu1/daytona-arcade-recomp)（Ben Templeman and contributors）
+- PSP 移植：木々　諒（Makoto Kiki）
 - [MAME](https://github.com/mamedev/mame)：CPU や描画の仕組みの参考と、一部コードの移植（BSD-3-Clause）
 - [pspdev](https://github.com/pspdev)：PSP 用のコンパイラと SDK
 - [ymfm](https://github.com/aaronsgiles/ymfm)、[Berkeley SoftFloat](https://github.com/ucb-bar/berkeley-softfloat-3)、[LZMA SDK](https://www.7-zip.org/sdk.html)
