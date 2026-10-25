@@ -2,8 +2,8 @@
 
 PSP 版は、リコンパイルしたゲーム（デイトナUSA、1994年 Revision A）を、
 カスタムファームウェアを入れた PSP-2000 / PSP-3000 / PSP Go で動かします。
-まだ開発中です。PSP-3000（ARK-5、333MHz）では、レース中の1フレームが約23ms かかります
-（アーケードは17.4ms、毎秒57.52フレーム）。
+まだ開発中です。PSP-3000（ARK-5）のオーバークロック設定（実測約450MHz）で、レース中は約40〜57fps です
+（アーケードは57.52fps。重い場面ほど下がります）。
 車の台数は、どのコースも10台です（アーケードは初級40、中級20、上級30台）。
 詳しくは [platform/psp/README.md](platform/psp/README.md) と
 [platform/psp/HANDOFF.md](platform/psp/HANDOFF.md) を見てください（どちらも英語）。
@@ -88,7 +88,7 @@ python3 platform/psp/build_psp.py game
 
 `PROFILE_TGP=1 python3 platform/psp/build_psp.py game` でビルドすると、
 CPU のハードウェアカウンタと処理ごとの時間をログに出す計測用のビルドになります。
-1フレームあたり約1ms 遅くなるので、計測のときだけ使ってください。
+約2〜3fps 遅くなるので、計測のときだけ使ってください。
 
 PSP 側は `build_psp.py` が Makefile（`platform/psp/Makefile`）を実行してビルドします。
 フロントエンド（`platform/psp/game/`）だけを変更したときは、もう一度 `game` を実行すれば、
