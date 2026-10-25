@@ -28,7 +28,7 @@ already knows check_culling culls by its first two tests skips
 model2_3d_process_polygon for exactly its side effects (rope, polygon z,
 texture addresses, linking); np_s reads the normal and the point in one
 GeoPtr::read. PPSSPP: frame dumps 3000/4500/6000 byte-identical, TRACE
-exact. Console (ARK-4 now really ~450 MHz: "measured about 452 MHz"): a
+exact. Console (ARK-5's overclock now really ~450 MHz: "measured about 452 MHz"): a
 light frame with objects 8.0 -> 6.4 ms; a busy one 12.3 ms (~16 expected
 before); totals 22.1 (light, 3.9 idle) and 22.9-25.0 ms (busy).
 
@@ -155,7 +155,7 @@ the engine): the mixing time is no longer printed.
 
 ## The sound mixed on the Media Engine (2026-10-23)
 
-Console (ARK-4, clock left alone): total 25.0 / 21.9 / 24.2 ms in a race;
+Console (ARK-5's overclock on, clock left alone): total 25.0 / 21.9 / 24.2 ms in a race;
 mixing 1.4 / 2.5 / 3.1 ms a frame, all on the game thread. Now the Media
 Engine mixes (game/media_engine.h, audio.h's me_worker): started as
 mcidclan's psp-media-engine-custom-core starts it (MIT; THIRD_PARTY.md),
@@ -181,9 +181,10 @@ never use it (race_basic TRACE 6000 unchanged). Log: "GAME Media Engine
 started" and "PROFILE Media Engine, ms per frame: mixing X (its CP0 Count
 as ms at the CPU clock), the game waiting Y". Not yet run on a console.
 
-## ARK-4's overclock and the clock left alone (2026-10-23)
+## The custom firmware's overclock and the clock left alone (2026-10-23)
 
-The player went back from ARK-5 to ARK-4 (final), with its overclock on.
+The player turned the custom firmware's overclock on (ARK-5: the player
+has only ever used ARK-5; notes here that said ARK-4 were mistaken).
 The draw change worked there (list 2.0 / 3.9 ms, from 3.3 / 9.0; draw
 cycles 2.2 M / 3.9 M, from 2.6 M / 6.9 M; uncached stores 6.6 K / 13 K,
 from 20 K / 54 K), but everything else ran 1.3-3x slower: core 20.7 / 25.7

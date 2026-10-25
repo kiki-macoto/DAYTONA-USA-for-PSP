@@ -1263,8 +1263,8 @@ std::string set_cpu_clock() {
     const int mhz = asked ? std::clamp(asked, 222, 444) : before > 333 ? before : 333;
     const char *how = asked ? "settings.txt" : mhz > 333 ? "the custom firmware's overclock, kept" : "the default";
     if (!asked && before >= 333) {
-        // Already there: not set again. ARK-4's overclock left 333 to read
-        // here, and setting 333 over it ran the game ~25% slower than ARK-5.
+        // Already there: not set again. ARK-5's overclock left 333 to read
+        // here, and setting 333 over it ran the game ~25% slower.
         if (before == 333) how = "already 333 (the custom firmware's), left as it is";
     } else if (mhz > 333) {
         if (mhz != before) sctrlHENSetSpeed(mhz, mhz / 2);
@@ -1280,7 +1280,7 @@ std::string set_cpu_clock() {
     }
     // The real speed, whatever scePower reads: a loop of 20 million taken
     // branches with an add in the delay slot, timed. 4 cycles an iteration
-    // on the console (PSP-3000, ARK-4, at its full speed: 165 MHz read with
+    // on the console (PSP-3000, ARK-5, at its full speed: 165 MHz read with
     // 2); PPSSPP takes 2, and reads double.
     unsigned n = 20000000;
     const uint32_t t0 = sceKernelGetSystemTimeLow();
