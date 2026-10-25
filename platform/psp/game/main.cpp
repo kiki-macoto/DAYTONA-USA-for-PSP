@@ -88,6 +88,13 @@ extern uint64_t (*g_tgp_profile_clock)();
 extern uint64_t g_tgp_profile_us;
 extern uint64_t g_tgp_profile_runs;
 extern void (*g_tgp_profile_enter)(), (*g_tgp_profile_leave)();
+// geo.cpp: the geometrizer's parse, on frames with objects [1] and without [0],
+// and model2_3d_process_polygon (1 call in 16 timed).
+extern uint64_t (*g_geo_profile_clock)();
+extern void (*g_geo_profile_enter)(), (*g_geo_profile_leave)();
+extern uint64_t g_geo_mode_objects[4], g_geo_mode_links[4];
+extern uint64_t g_geo_parse_us[2], g_geo_parses[2];
+extern uint64_t g_geo_polygon_calls, g_geo_polygon_sampled_us, g_geo_polygon_samples, g_geo_section_us[4];
 } // namespace rt
 #define TGP_PROFILE_MS(f) (double(rt::g_tgp_profile_us) / (f))
 #else
@@ -112,9 +119,11 @@ struct HwCounters {
         "uncached_store", "cached_load", "cached_store", "i_miss", "d_miss", "d_writeback", "cop0_inst", "fpu_inst",
         "vfpu_inst", "local_bus"};
     uint32_t now[kN] = {};
-    // [0] the game (run_frame; without the TGP's runs while they are timed),
-    // [1] drawing (renderer.draw), [2] the TGP's runs (timed reports only)
-    uint64_t sum[3][kN] = {};
+    // [0] the game (run_frame; without the TGP's runs while they are timed,
+    // and without the geometrizer's parses with objects), [1] drawing
+    // (renderer.draw), [2] the TGP's runs (timed reports only), [3] those
+    // parses (geo.cpp's hooks)
+    uint64_t sum[4][kN] = {};
     bool ok = false;
 
     bool read(uint32_t (&to)[kN]) {
@@ -151,16 +160,16 @@ struct HwCounters {
     // One line per part: thousands a frame (per drawn frame for drawing).
     // The TGP's line only when its runs were counted apart (tgp_timed: the
     // game's line then leaves them out).
-    void report(int frames, int drawn, bool tgp_timed) {
+    void report(int frames, int drawn, int geo_frames, bool tgp_timed) {
         if (!ok) return;
-        for (int part = 0; part < 3; part++) {
+        for (int part = 0; part < 4; part++) {
             if (part == 2 && !tgp_timed) continue;
-            static const char *const names[] = {"game", "draw", "TGP"};
+            static const char *const names[] = {"game", "draw", "TGP", "geometry"};
             char line[512];
             int n = std::snprintf(line, sizeof line, "HW %s%s, thousands per %s:", names[part],
-                                  part == 0 ? (tgp_timed ? " without the TGP" : " with the TGP") : "",
-                                  part == 1 ? "drawn frame" : "frame");
-            const double per = part == 1 ? std::max(1, drawn) : std::max(1, frames);
+                                  part == 0 ? (tgp_timed ? " without the TGP or the geometry" : " with the TGP, without the geometry") : "",
+                                  part == 1 ? "drawn frame" : part == 3 ? "frame with objects" : "frame");
+            const double per = part == 1 ? std::max(1, drawn) : part == 3 ? std::max(1, geo_frames) : std::max(1, frames);
             for (int i = 0; i < kN && n < int(sizeof line) - 40; i++)
                 n += std::snprintf(line + n, sizeof line - n, " %s %.1f", kNames[i], sum[part][i] / per / 1000.0);
             say("%s\n", line);
@@ -173,6 +182,8 @@ struct HwCounters {
 HwCounters *g_hw = nullptr;
 static void hw_tgp_enter() { g_hw->add(0); }
 static void hw_tgp_leave() { g_hw->add(2); }
+static void hw_geo_enter() { g_hw->add(0); }
+static void hw_geo_leave() { g_hw->add(3); }
 #endif
 
 // The TGP's clock: two reads a TGP run, a few thousand a frame. The
@@ -209,9 +220,10 @@ constexpr size_t kMaxCache = 16u << 20;
 // 0x02805240; course 0 beginner, 1 expert, 2 advanced, as the laps table at
 // 0x02805248 shows: 8, 2, 4), and keeps it at work RAM 0x501080 (count - 1
 // at 0x501084). Found with m2run --ram-dump; m2run with these values on all
-// three courses: POSITION /20, 10/10, 10/10, the race and GAME OVER as usual.
+// three courses: POSITION /20, 10/10, 10/10, the race and GAME OVER as usual;
+// the beginner course with 10 too (2026-10-25: /10, the race as usual).
 struct Cars { uint32_t offset, arcade, psp; };
-constexpr Cars kCars[3] = {{0x805278, 40, 20}, {0x80527c, 30, 10}, {0x805280, 20, 10}};
+constexpr Cars kCars[3] = {{0x805278, 40, 10}, {0x80527c, 30, 10}, {0x805280, 20, 10}};
 constexpr double kArcadeHz = 57.52;     // the game's own frame rate: never run faster than this
 constexpr int kSaveEvery = 3600;        // frames between checks for changed settings to save
 constexpr size_t kCredits = 0x128;      // backup RAM: the credits (Revision A; see load_nvram)
@@ -814,6 +826,29 @@ void run_game() {
     // the stick (stick_pcm outlives audio: declared first).
     std::unique_ptr<StickPcm> stick_pcm;
     std::unique_ptr<psp::Audio> audio;
+    // The Media Engine mixes the sound (audio.h) unless settings.txt says
+    // "me 0", or it does not answer (PPSSPP does not run its code). On the
+    // console it slows the core a little (2-3 ms a frame in a busy race) but
+    // takes 3-4 ms of mixing off: about 1.5 ms a frame better (HANDOFF.md).
+    psp::MeLink *me = nullptr;
+    int me_wanted = 1;
+    if (FILE *f = std::fopen((g_dir + "settings.txt").c_str(), "r")) {
+        char line[128];
+        while (std::fgets(line, sizeof line, f))
+            if (line[0] != '#') std::sscanf(line, " me %d", &me_wanted);
+        std::fclose(f);
+    }
+    if (me_wanted && !kInputs[0]) { // (a recorded run keeps the 32 kHz sound it was checked with)
+        if (void *block = memalign(64, sizeof(psp::MeLink))) {
+            std::memset(block, 0, sizeof(psp::MeLink));
+            sceKernelDcacheWritebackInvalidateRange(block, sizeof(psp::MeLink));
+            auto *link = reinterpret_cast<psp::MeLink *>(reinterpret_cast<uintptr_t>(block) | 0x40000000u);
+            psp::g_me_link = link;
+            if (psp::me::start(&psp::me_worker, &link->alive, 200000)) me = link;
+        }
+        say(me ? "GAME Media Engine started: it mixes the sound\n"
+               : "GAME Media Engine did not answer in 200 ms: the sound is mixed here\n");
+    }
     try {
         if (low_memory) {
             stick_pcm = std::make_unique<StickPcm>();
@@ -821,12 +856,13 @@ void run_game() {
             audio = std::make_unique<psp::Audio>(
                 load_file(g_dir + "rom/sound_program.bin"), pcm->header(0), pcm->size(0), pcm->header(1), pcm->size(1),
                 [pcm](unsigned r, uint32_t offset, uint8_t *to, size_t n) { return pcm->read(r, offset, to, n); },
-                kLowSampleCache);
+                kLowSampleCache, me);
         } else {
             audio = std::make_unique<psp::Audio>(load_file(g_dir + "rom/sound_program.bin"),
-                                                 load_file(g_dir + "rom/pcm1.bin"), load_file(g_dir + "rom/pcm2.bin"));
+                                                 load_file(g_dir + "rom/pcm1.bin"), load_file(g_dir + "rom/pcm2.bin"),
+                                                 me);
         }
-        say("GAME sound on, heap %.2f MB\n", heap_mb());
+        say("GAME sound on, %u Hz, heap %.2f MB\n", audio->rate(), heap_mb());
     } catch (const std::exception &e) {
         say("GAME sound off: %s\n", e.what());
     }
@@ -915,6 +951,7 @@ void run_game() {
             double(c1 - c0) / n, double(c2 - c1) / n, unsigned(sink & 1));
     }
     rt::g_tgp_profile_clock = tgp_clock;
+    rt::g_geo_profile_clock = tgp_clock;
     bool tgp_timed = true;
     if (audio) audio->set_profile_clock([]() -> uint64_t { return psp::now_us(); }); // (PROFILE audio: the mixing)
     HwCounters hw;
@@ -925,6 +962,8 @@ void run_game() {
         rt::g_tgp_profile_leave = on && hw.ok ? hw_tgp_leave : nullptr;
     };
     set_tgp_hooks(tgp_timed);
+    rt::g_geo_profile_enter = hw.ok ? hw_geo_enter : nullptr;
+    rt::g_geo_profile_leave = hw.ok ? hw_geo_leave : nullptr;
 #endif
     const bool scripted = kInputs[0] != 0;
     Nvram nvram;
@@ -1070,10 +1109,18 @@ void run_game() {
                 draw_every == 1 ? "st" : draw_every == 2 ? "nd" : draw_every == 3 ? "rd" : "th", drawn_frames,
                 100.0 * double(game.board().spin_skipped()) / double(game.instructions()));
 #ifdef M2_PSP_PROFILE
-            hw.report(report, drawn_frames, tgp_timed);
-            if (audio) say("PROFILE audio, ms per frame: mixing %.1f (the rest of audio above: the sequencer)\n",
-                           double(audio->take_mix_us()) / f);
+            hw.report(report, drawn_frames, int(rt::g_geo_parses[1]), tgp_timed);
+            if (audio)
+                say(audio->media_engine() ? "PROFILE audio, ms per frame: writing the mixing jobs %.1f (the rest of audio "
+                                            "above: the sequencer)\n"
+                                          : "PROFILE audio, ms per frame: mixing %.1f (the rest of audio above: the sequencer)\n",
+                    double(audio->take_mix_us()) / f);
 #endif
+            if (audio && audio->media_engine())
+                say("PROFILE Media Engine mixing: the game waiting for it %.2f ms per frame; %llu jobs did not fit\n",
+                    double(audio->take_me_wait_us()) / 1000.0 / f, (unsigned long long)audio->job_overflows());
+            else if (audio && audio->me_given_up)
+                say("PROFILE Media Engine given up (a batch not done in 200 ms): the sound is mixed here\n");
             drawn_frames = 0;
             say("PROFILE draw, ms per drawn frame: layers %.1f sort+textures %.1f list %.1f GE wait %.1f; "
                 "ROM reads %.2f ms/frame\n",
@@ -1101,6 +1148,34 @@ void run_game() {
             set_tgp_hooks(tgp_timed);
             rt::g_tgp_profile_us = 0;
             rt::g_tgp_profile_runs = 0;
+            {
+                const double with = double(std::max<uint64_t>(rt::g_geo_parses[1], 1));
+                const double polygon_us = rt::g_geo_polygon_samples ? double(rt::g_geo_polygon_sampled_us) /
+                                                                          rt::g_geo_polygon_samples *
+                                                                          rt::g_geo_polygon_calls
+                                                                    : 0.0;
+                const double scale = rt::g_geo_polygon_samples
+                                         ? double(rt::g_geo_polygon_calls) / rt::g_geo_polygon_samples / 1000.0 / with
+                                         : 0.0;
+                say("PROFILE geometry: %.1f ms each frame with objects (%llu), %.2f each without (%llu); %.0f polygons "
+                    "a frame with objects, %.1f ms of it projecting and clipping them (1 in 16 timed: vertices and "
+                    "culling %.1f, texture reads %.1f, clipping %.1f, writing the polygon %.1f)\n",
+                    rt::g_geo_parse_us[1] / 1000.0 / with, (unsigned long long)rt::g_geo_parses[1],
+                    rt::g_geo_parse_us[0] / 1000.0 / double(std::max<uint64_t>(rt::g_geo_parses[0], 1)),
+                    (unsigned long long)rt::g_geo_parses[0], double(rt::g_geo_polygon_calls) / with,
+                    polygon_us / 1000.0 / with, rt::g_geo_section_us[0] * scale, rt::g_geo_section_us[1] * scale,
+                    rt::g_geo_section_us[2] * scale, rt::g_geo_section_us[3] * scale);
+                say("PROFILE geometry modes, objects (links) a frame with objects: np_ns %.0f (%.0f), np_s %.0f (%.0f), "
+                    "nn_ns %.0f (%.0f), nn_s %.0f (%.0f)\n",
+                    rt::g_geo_mode_objects[0] / with, rt::g_geo_mode_links[0] / with, rt::g_geo_mode_objects[1] / with,
+                    rt::g_geo_mode_links[1] / with, rt::g_geo_mode_objects[2] / with, rt::g_geo_mode_links[2] / with,
+                    rt::g_geo_mode_objects[3] / with, rt::g_geo_mode_links[3] / with);
+                for (uint64_t &n : rt::g_geo_mode_objects) n = 0;
+                for (uint64_t &n : rt::g_geo_mode_links) n = 0;
+                for (uint64_t &us : rt::g_geo_section_us) us = 0;
+                rt::g_geo_parse_us[0] = rt::g_geo_parse_us[1] = rt::g_geo_parses[0] = rt::g_geo_parses[1] = 0;
+                rt::g_geo_polygon_calls = rt::g_geo_polygon_sampled_us = rt::g_geo_polygon_samples = 0;
+            }
 #endif
             rom->read_us = 0;
             report_t0 = psp::now_us();
@@ -1109,6 +1184,7 @@ void run_game() {
     g_game = nullptr; // (the watchdog: the game goes at the end of this function)
 #ifdef M2_PSP_PROFILE
     set_tgp_hooks(false); // (hw goes at the end of this function)
+    rt::g_geo_profile_enter = rt::g_geo_profile_leave = nullptr;
     g_hw = nullptr;
 #endif
     g_phase = kPhaseStart;
@@ -1186,7 +1262,11 @@ std::string set_cpu_clock() {
     const int before = scePowerGetCpuClockFrequency();
     const int mhz = asked ? std::clamp(asked, 222, 444) : before > 333 ? before : 333;
     const char *how = asked ? "settings.txt" : mhz > 333 ? "the custom firmware's overclock, kept" : "the default";
-    if (mhz > 333) {
+    if (!asked && before >= 333) {
+        // Already there: not set again. ARK-4's overclock left 333 to read
+        // here, and setting 333 over it ran the game ~25% slower than ARK-5.
+        if (before == 333) how = "already 333 (the custom firmware's), left as it is";
+    } else if (mhz > 333) {
         if (mhz != before) sctrlHENSetSpeed(mhz, mhz / 2);
         // Not set (no such call: PPSSPP left 222): 333 rather than slower.
         if (scePowerGetCpuClockFrequency() < 333) {
@@ -1198,9 +1278,18 @@ std::string set_cpu_clock() {
     } else {
         scePowerSetClockFrequency(mhz, mhz, mhz / 2);
     }
-    char text[200];
-    std::snprintf(text, sizeof text, "CPU %d MHz, bus %d MHz (asked %d: %s; it was %d)", scePowerGetCpuClockFrequency(),
-                  scePowerGetBusClockFrequency(), mhz, how, before);
+    // The real speed, whatever scePower reads: a loop of 20 million taken
+    // branches with an add in the delay slot, timed. 4 cycles an iteration
+    // on the console (PSP-3000, ARK-4, at its full speed: 165 MHz read with
+    // 2); PPSSPP takes 2, and reads double.
+    unsigned n = 20000000;
+    const uint32_t t0 = sceKernelGetSystemTimeLow();
+    __asm__ __volatile__(".set push\n.set noreorder\n1: bnez %0, 1b\naddiu %0, %0, -1\n.set pop" : "+r"(n));
+    const uint32_t us = std::max<uint32_t>(sceKernelGetSystemTimeLow() - t0, 1);
+    char text[240];
+    std::snprintf(text, sizeof text, "CPU %d MHz, bus %d MHz (asked %d: %s; it was %d); measured about %u MHz",
+                  scePowerGetCpuClockFrequency(), scePowerGetBusClockFrequency(), mhz, how, before,
+                  unsigned(80000000ull / us));
     return text;
 }
 

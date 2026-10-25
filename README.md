@@ -32,17 +32,17 @@
 
 | 項目 | 状態 |
 | --- | --- |
-| 動作確認 | PSP-3000（ARK-5、333MHz）、PPSSPP 1.19.3 |
-| 速度 | レース中は1フレーム約23ms（アーケードは17.4ms）。アーケードの約75%の速さです |
+| 動作確認 | PSP-3000（ARK-4 のオーバークロックで約450MHz、ARK-5 で333MHz）、PPSSPP 1.19.3 |
+| 速度 | 約450MHz で、軽い場面はほぼアーケードどおり（1フレーム17.4ms）、重い場面は1フレーム約23〜25ms |
 | 描画 | 2フレームに1回。重い場面では3〜4フレームに1回に自動で落とします |
-| 音声 | あり |
-| 車の台数 | 初級20台、中級10台、上級10台（アーケードは40、20、30台）。速度のために減らしています |
+| 音声 | あり。PSP の2つ目のプロセッサ（メディアエンジン）でミキシングします |
+| 車の台数 | どのコースも10台（アーケードは初級40、中級20、上級30台）。速度のために減らしています |
 | セーブ | 設定と記録を `save/` に保存します |
 
 ### 既知の問題
 
 - まだアーケードの速度に届いていません（高速化を続けています）
-- 333MHz を超えるクロックは、ARK-5 では設定できませんでした
+- 333MHz を超えるクロックは、ARK-5 では設定できませんでした（ARK-4 のオーバークロックでは約450MHz で動きます）
 - まだ安定していません。導入は自己責任でお願いします。
 
 ## 必要なもの
@@ -115,7 +115,8 @@ cpu 333
 
 - `cpu`：CPU クロック（222〜444MHz）。書かなければ 333MHz で動きます
   - CFW のオーバークロックで 333MHz より高くしてある場合は、そのクロックを使います
-- 実際に動いたクロックは `daytona.log` の1行目に出ます
+- 実際に動いたクロックは `daytona.log` の1行目に出ます（`measured about ○○ MHz` が実測値）
+- `me 0`：音声のミキシングをメディアエンジン（ME）ではなくメイン CPU で行います。書かなければ ME を使います（ME を使うときは 44.1kHz）。ME を使っている間は、ゲーム中に PSP をスリープさせないでください
 
 ## オーバーレイ（ベゼル）
 
@@ -150,4 +151,5 @@ Daytona USA および SEGA は株式会社セガの商標です。
 - PSP 移植：木々　諒（Makoto Kiki）
 - [MAME](https://github.com/mamedev/mame)：CPU や描画の仕組みの参考と、一部コードの移植（BSD-3-Clause）
 - [pspdev](https://github.com/pspdev)：PSP 用のコンパイラと SDK
+- [psp-media-engine-custom-core](https://github.com/mcidclan/psp-media-engine-custom-core)（mcidclan）：メディアエンジンの起動手順の参考（MIT ライセンス）
 - [ymfm](https://github.com/aaronsgiles/ymfm)、[Berkeley SoftFloat](https://github.com/ucb-bar/berkeley-softfloat-3)、[LZMA SDK](https://www.7-zip.org/sdk.html)

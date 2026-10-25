@@ -10,6 +10,14 @@ SDK), the PSP build links:
 | GCC's libstdc++ and libgcc (C++ library, soft `double`) | https://github.com/pspdev/gcc | `1a339979` (2026-05-11), GCC 15.2.0 | GPL-3 with the GCC Runtime Library Exception | No |
 | pthread-embedded (pspdev's threads, pulled in by libstdc++) | https://github.com/pspdev/pthread-embedded | `97fe4ce0` (2026-05-12) | LGPL-2.1 (its PS Vita port's parts MIT) | No |
 
+`game/media_engine.h` adapts the Media Engine start-up of
+[psp-media-engine-custom-core](https://github.com/mcidclan/psp-media-engine-custom-core)
+by mcidclan (read at `0197c99e`, MIT License, Copyright (c) 2026 mcidclan
+(m-c/d, m-cid)): the reset-vector handler (the register writes and the
+stack choice) and the cache routines, with the MIT notice in the file. The
+library itself (its kernel module, mapping tables and VME code) is not used
+or linked.
+
 The toolchain itself is not part of this repository; the versions are those
 of the pspdev build recorded in `~/pspdev/build.txt` on the machine the port
 was built on. The runtime library exception covers linking libstdc++ and

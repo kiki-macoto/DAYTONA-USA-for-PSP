@@ -4,7 +4,7 @@ PSP 版は、リコンパイルしたゲーム（デイトナUSA、1994年 Revis
 カスタムファームウェアを入れた PSP-2000 / PSP-3000 / PSP Go で動かします。
 まだ開発中です。PSP-3000（ARK-5、333MHz）では、レース中の1フレームが約23ms かかります
 （アーケードは17.4ms、毎秒57.52フレーム）。
-車の台数は、初級20台、中級と上級が10台です（アーケードは40、20、30台）。
+車の台数は、どのコースも10台です（アーケードは初級40、中級20、上級30台）。
 詳しくは [platform/psp/README.md](platform/psp/README.md) と
 [platform/psp/HANDOFF.md](platform/psp/HANDOFF.md) を見てください（どちらも英語）。
 
@@ -118,6 +118,19 @@ cpu 333
 333MHz を超えるクロックはカスタムファームウェアに設定を頼みます（`sctrlHENSetSpeed`）が、
 設定されないこともあります。PSP-3000 の ARK-5 では、440 を指定しても 333MHz のままでした。
 実際に動いたクロックとその理由は、`daytona.log` の1行目に出ます。
+
+## メディアエンジン（ME）
+
+音声のミキシングは、PSP の2つ目のプロセッサであるメディアエンジンが行い、メイン CPU の負担を減らします。
+このときの音声は 44.1kHz です。ME が応答しないとき（PPSSPP など）は、自動でメイン CPU が 32kHz でミキシングします。
+ME を使わないようにするには、`settings.txt` に次の行を書きます。
+
+```
+me 0
+```
+
+ME の起動手順は、mcidclan さんの [psp-media-engine-custom-core](https://github.com/mcidclan/psp-media-engine-custom-core)（MIT ライセンス）を参考にしています。
+ME を使うとシステム側の ME の処理が止まるので、ゲーム中に PSP をスリープさせないでください。
 
 ## オーバーレイ（ベゼル）
 

@@ -75,7 +75,8 @@ public:
         for (int i = 0; i < 256; i++) gamma_[i] = uint8_t(std::max((double(i) - 64.0) * 255.0 / 191.0, 0.0));
         list_ = static_cast<uint32_t *>(aligned(kListBytes));
         palettes_ = static_cast<uint32_t *>(aligned(kPaletteBytes));
-        if (!list_ || !palettes_) throw std::runtime_error("no RAM for the display list");
+        vertices_ = static_cast<Vertex *>(aligned(kVertices * sizeof(Vertex)));
+        if (!list_ || !palettes_ || !vertices_) throw std::runtime_error("no RAM for the display list");
 
         sceGuInit();
         sceGuStart(GU_DIRECT, list_);
@@ -163,7 +164,13 @@ public:
         if (palettes_used_) sceKernelDcacheWritebackRange(palettes_, palettes_used_ * 64);
         lap(1);
 
-        sceGuStart(GU_DIRECT, list_);
+        // The list is built whole and handed over at the end (GU_SEND): in
+        // GU_DIRECT every sceGuDrawArray and sceGuGetMemory updates the GE's
+        // stall address, a system call, two a polygon.
+        sceGuStart(GU_SEND, list_);
+        // (GU_DIRECT's sceGuStart sets the draw buffer, which sceGuSwapBuffers
+        // swaps; GU_SEND's does not: without this the GE drew into one buffer.)
+        sceGuDrawBufferList(GU_PSM_5650, reinterpret_cast<void *>(draw_buffer_), kStride);
         sceGuClearColor(0xff000000u);
         sceGuClear(GU_COLOR_BUFFER_BIT);
         sceGuTexFlush(); // textures built this frame may sit where others were
@@ -197,6 +204,7 @@ public:
         const uint32_t *palette_now = nullptr;
         bool texturing = true; // as layer() left it
         size_t used = 0;
+        vertices_used_ = 0;
         for (auto e = order_.rbegin(); e != order_.rend(); ++e) {
             const rt::GeoPoly &poly = polys[e->index];
             if (poly.window > video.gpu_windows() || poly.num_vertices < 3 || poly.num_vertices > 8) continue;
@@ -204,8 +212,11 @@ public:
             const Source *source = nullptr;
             if (renderer & 2) source = e->palette ? e->source : nullptr; // (found in the pass above)
             else if (renderer & 1) continue; // as the Vita and the Dreamcast: not drawn
-            const size_t bytes = size_t(poly.num_vertices) * sizeof(Vertex) + 64;
-            if (used + bytes > kListBytes - kListReserve) { ++skipped; continue; }
+            constexpr size_t bytes = 64; // (the commands; the vertices are in vertices_)
+            if (used + bytes > kListBytes - kListReserve || vertices_used_ + poly.num_vertices > kVertices) {
+                ++skipped;
+                continue;
+            }
             if (source) {
                 if (!texturing) {
                     sceGuEnable(GU_TEXTURE_2D);
@@ -247,8 +258,10 @@ public:
         // The front layers, see-through where they have no pixel.
         sceGuEnable(GU_TEXTURE_2D);
         layer(front.data(), GU_PSM_5551);
-        list_bytes = used;
+        list_bytes = used + vertices_used_ * sizeof(Vertex);
+        sceKernelDcacheWritebackRange(vertices_, unsigned(vertices_used_ * sizeof(Vertex)));
         sceGuFinish();
+        sceGuSendList(GU_TAIL, list_, &ge_context_);
         if (dump_path) {
             sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
             dump(dump_path);
@@ -313,7 +326,8 @@ private:
     static constexpr uintptr_t kFrame0 = 0, kFrame1 = kStride * kScreenH * 2, kDepth = 2 * kFrame1;
     static constexpr int kW = 496, kH = 384, kTexW = 512, kTexH = 512;
     static constexpr float kScale = float(kScreenH) / kH, kOffsetX = (kScreenW - kW * kScale) * 0.5f;
-    static constexpr size_t kListBytes = 1536 * 1024;  // the busiest frame: ~2,200 polygons
+    static constexpr size_t kListBytes = 512 * 1024;   // commands (the busiest frame: ~2,200 polygons, 64 bytes each)
+    static constexpr size_t kVertices = 24576;          // a frame's polygon vertices (vertices_)
     static constexpr size_t kListReserve = 16 * 1024;   // the layers' strips and the list's own commands
     static constexpr uint32_t kTextureLimit = 256;      // source textures at most this a side (before mirroring)
     static constexpr unsigned kBuildsPerFrame = 32;     // new source textures a frame
@@ -648,7 +662,7 @@ private:
     // and ay the polygon's own. No divide per vertex.
     bool polygon(const rt::GeoPoly &poly, const rt::Video &video, uint32_t colour, const Source *material) {
         const int n = poly.num_vertices;
-        auto *v = static_cast<Vertex *>(sceGuGetMemory(unsigned(sizeof(Vertex) * n)));
+        Vertex *v = vertices_ + vertices_used_;
         const float cx = float(video.crtc_x() + poly.center[0]), cy = float((384 - poly.center[1]) + video.crtc_y());
         constexpr float kBx = kScale * (2.0f / kScreenW), kBy = kScale * (2.0f / kScreenH);
         const float ax = (kOffsetX + cx * kScale - kScreenW * 0.5f) * (2.0f / kScreenW);
@@ -658,7 +672,7 @@ private:
             const rt::GeoVertex &in = poly.v[i];
             const float pz = in.p[0];
             // (a - a is 0 for a finite a, NaN for an infinite or NaN one.)
-            if (!(pz > 0.0f) || pz - pz != 0.0f) return false; // (the vertices' room in the list is left unused)
+            if (!(pz > 0.0f) || pz - pz != 0.0f) return false; // (vertices_used_ not moved: the next polygon writes over these)
             Vertex &out = v[i];
             out.x = ax * pz + kBx * in.x;
             out.y = ay * pz + kBy * in.y;
@@ -671,6 +685,7 @@ private:
         // (The matrices were loaded once, before the polygons: sceGumUpdateMatrix there.)
         sceGuDrawArray(GU_TRIANGLE_FAN, GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D, n,
                        nullptr, v);
+        vertices_used_ += size_t(n);
         return true;
     }
 
@@ -679,6 +694,12 @@ private:
     bool flush_ = false;
     uint32_t *list_ = nullptr;
     uint32_t *palettes_ = nullptr;
+    // The polygons' vertices, written through the CPU's cache (the list
+    // sceGuStart gives is uncached: a store each went to memory) and written
+    // back once, before the list is sent.
+    Vertex *vertices_ = nullptr;
+    size_t vertices_used_ = 0;
+    PspGeContext ge_context_ = {}; // (the GE's state, saved and restored around the sent list)
     unsigned palettes_used_ = 0, builds_ = 0;
     uint64_t back_flushed_ = ~0ull, front_flushed_ = ~0ull; // the layers' generations written back
     std::vector<Entry> order_, order_tmp_;

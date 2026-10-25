@@ -12,7 +12,7 @@ here changes the main tree.
   build_psp.py compile  [--host-build-dir build-daytona] [--jobs N]
   build_psp.py game     [--host-build-dir build-daytona] [--jobs N]
                         [--draw-every N] [--inputs SCRIPT] [--nvram DIR]
-                        [--overlay PNG] [--deploy DIR] [--ppsspp EXE] [--timeout S]
+                        [--fast-inaccuracy] [--overlay PNG] [--deploy DIR] [--ppsspp EXE] [--timeout S]
 
 host:     the host build without the windowed app (no SDL, so nothing to
           install beyond a C++ compiler, CMake and Python): fetches SoftFloat,
@@ -191,25 +191,76 @@ def psp_gen(out, src):
     return dst
 
 
+def fast_inaccuracy_code(host, out):
+    """--fast-inaccuracy: the Vita's fast code (scripts/build_vita.py's
+    vita_code): the i960 by m2recomp --fast_inaccuracy (lockstep checks once a
+    basic block, direct chunk chaining: interrupts a few instructions late,
+    so not the desktop's counts) with fast_gen.py's direct work-RAM accesses;
+    the TGP by m2tgprecomp --fast_inaccuracy (its count once a block; exact:
+    the TGP has no interrupts). Far less code per i960 instruction than the
+    exact rewrite (the instruction cache: the core's misses). Into
+    out/gen_fi, rewritten only where the output changes."""
+    cache = host / "rom_cache" / "daytona"
+    tmp = out / "gen_fi_tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    (tmp / "daytona").mkdir(parents=True)
+    (tmp / "daytona_tgp").mkdir(parents=True)
+    i960 = [host / "m2recomp", cache / "program.bin", tmp / "daytona", "--seeds", "seeds/daytona.txt",
+            "--fast_inaccuracy"]
+    if (ROOT / "seeds" / "daytona_hooks.txt").is_file():
+        i960 += ["--hooks", "seeds/daytona_hooks.txt"]
+    run(i960)
+    run([host / "m2tgprecomp", cache / "tgp_program.bin", tmp / "daytona_tgp" / "tgp_gen.cpp", "--fast_inaccuracy"])
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("psp_fast_gen", FAST_GEN)
+    fast_gen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fast_gen)
+    stats = {"wram": 0}
+    final = out / "gen_fi"
+    for folder in ("daytona", "daytona_tgp"):
+        (final / folder).mkdir(parents=True, exist_ok=True)
+        names = set()
+        for f in sorted((tmp / folder).glob("*.cpp")):
+            text = f.read_text()
+            if folder == "daytona" and f.name.startswith("chunk_"):
+                text = "\n".join(fast_gen.direct_wram(line, stats) for line in text.split("\n"))
+            dst = final / folder / f.name
+            names.add(f.name)
+            if not dst.is_file() or dst.read_text() != text:
+                dst.write_text(text, newline="\n")
+        for old in (final / folder).glob("*.cpp"):
+            if old.name not in names:
+                old.unlink()
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(f"build_psp: --fast-inaccuracy code, {stats['wram']} work-RAM accesses direct", flush=True)
+    return final / "daytona", final / "daytona_tgp"
+
+
 def game(args):
     host = host_dir(args)
     gen = gen_dir(args)
     out = host / "psp"
-    # The i960 code with fewer lockstep checks and the TGP code with its
-    # count in a local: the Dreamcast's rewrite (scripts/fast_gen.py, from
-    # platform/dreamcast), the same on any target; it rewrites only the files whose
-    # output changes.
-    fast = out / "gen_fast" / "daytona"
-    fast_tgp = out / "gen_fast" / "daytona_tgp"
-    run([sys.executable, FAST_GEN, gen / "daytona", fast])
-    run([sys.executable, FAST_GEN, gen / "daytona_tgp", fast_tgp])
-    # Then the PSP's own pass (scripts/psp_gen.py): the rare checks' code
-    # out of the straight path, for the instruction cache. Same behaviour.
-    fast, fast_tgp = psp_gen(out, fast), psp_gen(out, fast_tgp)
+    if args.fast_inaccuracy:
+        fast, fast_tgp = fast_inaccuracy_code(host, out)
+    else:
+        # The i960 code with fewer lockstep checks and the TGP code with its
+        # count in a local: the Dreamcast's rewrite (scripts/fast_gen.py, from
+        # platform/dreamcast), the same on any target; it rewrites only the
+        # files whose output changes.
+        fast = out / "gen_fast" / "daytona"
+        fast_tgp = out / "gen_fast" / "daytona_tgp"
+        run([sys.executable, FAST_GEN, gen / "daytona", fast])
+        run([sys.executable, FAST_GEN, gen / "daytona_tgp", fast_tgp])
+        # Then the PSP's own pass (scripts/psp_gen.py): the rare checks' code
+        # out of the straight path, for the instruction cache. Same behaviour.
+        fast, fast_tgp = psp_gen(out, fast), psp_gen(out, fast_tgp)
+    # Each kind of code's objects apart (make keeps an object whose source
+    # moved but is older).
+    objs = host / "psp_fi" if args.fast_inaccuracy else out
     # The recorded input script, compiled in (game/inputs.h; empty: the pad),
     # and the draw rate. Written only when it changes, so make rebuilds only then.
     text = (ROOT / args.inputs).read_text() if args.inputs else ""
-    header = out / "game" / "inputs.h"
+    header = objs / "game" / "inputs.h"
     content = ("// Written by build_psp.py: the recorded input script (--inputs), or none,\n"
                "// the frames per picture (--draw-every) and the frame dumps (--dump-every).\n"
                f"static const char kInputs[] = R\"INPUTS({text})INPUTS\";\n"
@@ -218,13 +269,13 @@ def game(args):
     header.parent.mkdir(parents=True, exist_ok=True)
     if not header.is_file() or header.read_text() != content:
         header.write_text(content, newline="\n")
-    make(args, out, ["game"], [f"GEN={gen}", f"GEN_I960={fast}", f"GEN_TGP={fast_tgp}"])
+    make(args, objs, ["game"], [f"GEN={gen}", f"GEN_I960={fast}", f"GEN_TGP={fast_tgp}"])
 
     # The folder for the memory stick: the program and the ROM images.
     images = host / "rom_cache" / "daytona"
     package = out / "DAYTONA"
     (package / "rom").mkdir(parents=True, exist_ok=True)
-    shutil.copy2(out / "game" / "EBOOT.PBP", package / "EBOOT.PBP")
+    shutil.copy2(objs / "game" / "EBOOT.PBP", package / "EBOOT.PBP")
     for name in ROM_FILES:
         src = images / f"{name}.bin"
         if not src.is_file():
@@ -256,7 +307,11 @@ def game(args):
             "# custom firmware's overclock when it is set past 333, else runs at 333.\n"
             "# Past 333 needs the custom firmware; whether a console is stable there\n"
             "# is the console's own.\n"
-            "#cpu 333\n", newline="\r\n")
+            "#cpu 333\n"
+            "#\n"
+            "# The Media Engine (the PSP's second processor) mixes the sound; me 0\n"
+            "# mixes it on the main processor instead.\n"
+            "#me 0\n", newline="\r\n")
     # A picture at the sides of the screen (a PNG: scripts/make_overlay.py):
     # overlay.bin, which the game shows when it is there.
     if args.overlay:
@@ -288,6 +343,9 @@ def main(argv=None):
                          "use --draw-every 1 so every such frame is drawn)")
     ap.add_argument("--nvram", help="game: settings EEPROM and backup RAM to start from (the desktop's data folder; "
                     "default: a single cabinet, made by m2run with scripts/single_cabinet.txt)")
+    ap.add_argument("--fast-inaccuracy", action="store_true",
+                    help="game: the Vita's fast code (i960 lockstep checks once a block: interrupts a few instructions "
+                         "late, not the desktop's counts; TGP fast mode, exact); its objects in psp_fi")
     ap.add_argument("--overlay", help="game: a PNG shown around the game (its see-through or white area is the "
                     "game's window): made into overlay.bin next to EBOOT.PBP")
     ap.add_argument("--deploy", help="copy the result into this PSP/GAME folder (a memory stick's, or PPSSPP's)")

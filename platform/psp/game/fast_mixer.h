@@ -37,6 +37,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <list>
 #include <stdexcept>
@@ -48,6 +49,7 @@ namespace psp {
 class FastSoundEngine {
 public:
     static constexpr unsigned kVoices = snd::NativeSampleMixer::kVoices;
+    static constexpr size_t kChunk = 512; // output frames mixed at once
     static constexpr size_t kCacheBytes = 3u << 20;
     static constexpr size_t kHeaderBytes = snd::NativeSampleBank::kSamples * 12; // a PCM ROM's sample table
     // Reads n bytes at a PCM ROM's (0 or 1) offset; false if it cannot.
@@ -117,9 +119,79 @@ public:
     size_t cached_bytes() const { return cache_bytes_; }
     uint64_t decodes = 0, rejected = 0;
     // The mixing's own time (the rest of render is the sequencer), when a
-    // clock is set: microseconds.
+    // clock is set: microseconds. (With jobs, the time to write them.)
     uint64_t (*clock)() = nullptr;
     uint64_t mix_us = 0;
+
+    // ---- Mixing on another processor (the PSP's Media Engine) ----
+    // With offload(), render() writes a job for each stretch between voice
+    // events instead of mixing it: where the output goes, its frames, and a
+    // copy of every playing voice as it stands; the voices then move on
+    // here exactly as mix_voice moves them (the envelope a block at a time,
+    // the phase by the block's steps at once), without their samples.
+    // run_jobs (the other processor) mixes the jobs, block for block as
+    // mix() would. A sample a job names is not evicted in the same batch
+    // (the other processor may not have read it yet): the caller starts
+    // each batch (begin_batch) only once the last one has been mixed.
+    struct JobVoice {
+        const int16_t *data;
+        uint32_t index, frac, step_index, step_frac, end, loop;
+        int32_t gain_l, gain_r, level, level_step;
+        uint32_t stage_left;
+        uint8_t stage, looping, pad[2];
+    };
+    struct JobHeader {
+        int16_t *out;
+        uint32_t count, voices;
+    };
+    // The other processor's own: the mixing buffer and the limiter (64-byte
+    // aligned, whole lines: written back from its cache).
+    struct alignas(64) MixState {
+        int32_t acc[kChunk * 2];
+        float limiter, recovery;
+        int32_t ceiling;
+        uint32_t pad[13];
+    };
+    void offload(uint8_t *jobs, size_t capacity) {
+        jobs_ = jobs;
+        job_capacity_ = capacity;
+        job_used_ = 0;
+    }
+    bool offloaded() const { return jobs_ != nullptr; }
+    void begin_batch() {
+        job_used_ = 0;
+        ++batch_;
+    }
+    size_t job_bytes() const { return job_used_; }
+    void init_mix_state(MixState &s) const {
+        std::fill(std::begin(s.acc), std::end(s.acc), 0);
+        s.limiter = limiter_;
+        s.recovery = recovery_;
+        s.ceiling = int32_t(kCeiling * kOne);
+    }
+    uint64_t job_overflows = 0; // stretches left silent: no room for their job
+    // Called on decoded samples' data, for the other processor to read it
+    // from memory (the PSP: written back from this processor's cache).
+    void (*writeback)(const void *data, size_t bytes) = nullptr;
+
+    static void run_jobs(const uint8_t *jobs, size_t bytes, MixState &s) {
+        for (size_t at = 0; at + sizeof(JobHeader) <= bytes;) {
+            JobHeader h;
+            std::memcpy(&h, jobs + at, sizeof h);
+            at += sizeof h;
+            JobVoice voices[kVoices];
+            const uint32_t count_v = std::min<uint32_t>(h.voices, kVoices);
+            std::memcpy(voices, jobs + at, count_v * sizeof(JobVoice));
+            at += h.voices * sizeof(JobVoice);
+            for (size_t done = 0; done < h.count;) {
+                const size_t n = std::min<size_t>(h.count - done, kChunk);
+                std::fill_n(s.acc, n * 2, 0);
+                for (uint32_t i = 0; i < count_v; ++i) mix_job_voice(voices[i], s.acc, n);
+                limit(s.acc, h.out + done * 2, n, s.limiter, s.recovery, s.ceiling);
+                done += n;
+            }
+        }
+    }
 
 private:
     static constexpr unsigned kBlock = 16;
@@ -131,6 +203,7 @@ private:
         std::vector<int16_t> data; // frames + 1 (the guard)
         uint64_t used = 0;
         unsigned playing = 0;
+        uint32_t job_batch = 0; // the last batch whose jobs read it
     };
     enum class Stage : uint8_t { Attack, Sustain, Release };
     struct Voice {
@@ -269,6 +342,7 @@ private:
         else
             for (uint32_t f = 0; f < s.frames; ++f) d.data[f] = int16_t(std::lround(b.value(index, f) * 32768.0f));
         d.data[s.frames] = d.data[s.loop_start]; // the loop's next frame (the engine's voices all loop)
+        if (writeback) writeback(d.data.data(), d.data.size() * 2);
         d.used = ++clock_;
         cache_bytes_ += bytes;
         ++decodes;
@@ -311,7 +385,9 @@ private:
     bool evict() {
         auto victim = cache_.end();
         for (auto it = cache_.begin(); it != cache_.end(); ++it)
-            if (!it->second.playing && (victim == cache_.end() || it->second.used < victim->second.used)) victim = it;
+            if (!it->second.playing && !(jobs_ && it->second.job_batch == batch_) &&
+                (victim == cache_.end() || it->second.used < victim->second.used))
+                victim = it;
         if (victim == cache_.end()) return false;
         cache_bytes_ -= victim->second.data.size() * 2;
         cache_.erase(victim);
@@ -319,6 +395,10 @@ private:
     }
 
     void mix(int16_t *out, size_t count) {
+        if (jobs_) {
+            write_job(out, count);
+            return;
+        }
         for (size_t done = 0; done < count;) {
             const size_t n = std::min(count - done, acc_.size() / 2);
             std::fill_n(acc_.begin(), n * 2, 0);
@@ -368,19 +448,120 @@ private:
         }
     }
 
+    // A stretch as a job (see offload): the header and the playing voices,
+    // then the voices moved on as mix() would move them.
+    void write_job(int16_t *out, size_t count) {
+        unsigned active = 0;
+        for (const Voice &v : voices_) active += v.active;
+        const size_t bytes = sizeof(JobHeader) + active * sizeof(JobVoice);
+        if (job_used_ + bytes > job_capacity_) {
+            ++job_overflows; // (the ring keeps what was there: a moment of old sound)
+        } else {
+            const JobHeader h{out, uint32_t(count), active};
+            std::memcpy(jobs_ + job_used_, &h, sizeof h);
+            size_t at = job_used_ + sizeof h;
+            for (Voice &v : voices_) {
+                if (!v.active) continue;
+                const JobVoice j{v.data, v.index, v.frac, v.step_index, v.step_frac, v.end, v.loop, v.gain_l,
+                                 v.gain_r, v.level, v.level_step, v.stage_left, uint8_t(v.stage),
+                                 uint8_t(v.looping), {0, 0}};
+                std::memcpy(jobs_ + at, &j, sizeof j);
+                at += sizeof j;
+                if (v.sample) v.sample->job_batch = batch_;
+            }
+            job_used_ = at;
+        }
+        for (size_t done = 0; done < count;) {
+            const size_t n = std::min(count - done, kChunk);
+            for (Voice &v : voices_)
+                if (v.active) advance(v, n);
+            done += n;
+        }
+    }
+    // mix_voice without the samples: the envelope as there, the phase by a
+    // block's steps at once (the same index and fraction: the loop wraps
+    // modulo its length either way).
+    void advance(Voice &v, size_t count) {
+        for (size_t at = 0; at < count && v.active;) {
+            const size_t n = std::min<size_t>(kBlock, count - at);
+            if (v.stage != Stage::Sustain) {
+                const uint32_t steps = std::min<uint32_t>(uint32_t(n), v.stage_left);
+                v.level += v.level_step * int32_t(steps);
+                v.stage_left -= steps;
+                if (!v.stage_left) {
+                    if (v.stage == Stage::Release) { stop(v); break; }
+                    v.level = kOne << 8;
+                    v.stage = Stage::Sustain;
+                }
+            }
+            const uint64_t phase = (uint64_t(v.index) << 32 | v.frac) +
+                                   (uint64_t(v.step_index) << 32 | v.step_frac) * uint64_t(n);
+            uint64_t index = phase >> 32;
+            v.frac = uint32_t(phase);
+            if (index >= v.end) {
+                if (!v.looping) { stop(v); break; }
+                index = v.loop + (index - v.end) % (v.end - v.loop);
+            }
+            v.index = uint32_t(index);
+            at += n;
+        }
+    }
+    // mix_voice on a job's copy of a voice (the other processor: no stop()
+    // bookkeeping, the copy is dropped after).
+    static void mix_job_voice(JobVoice &v, int32_t *acc, size_t count) {
+        const int16_t *data = v.data;
+        for (size_t at = 0; at < count;) {
+            const size_t n = std::min<size_t>(kBlock, count - at);
+            if (v.stage != uint8_t(Stage::Sustain)) {
+                const uint32_t steps = std::min<uint32_t>(uint32_t(n), v.stage_left);
+                v.level += v.level_step * int32_t(steps);
+                v.stage_left -= steps;
+                if (!v.stage_left) {
+                    if (v.stage == uint8_t(Stage::Release)) return;
+                    v.level = kOne << 8;
+                    v.stage = uint8_t(Stage::Sustain);
+                }
+            }
+            const int32_t level = std::max(0, v.level >> 8);
+            const int32_t al = (level * v.gain_l) >> 15, ar = (level * v.gain_r) >> 15; // Q12
+            int32_t *o = acc + at * 2;
+            uint32_t index = v.index, frac = v.frac;
+            const uint32_t step_index = v.step_index, step_frac = v.step_frac, end = v.end;
+            for (size_t k = 0; k < n; ++k) {
+                const int32_t a = data[index], b = data[index + 1];
+                const int32_t s = a + (((b - a) * int32_t(frac >> 17)) >> 15); // (15 bits of the fraction)
+                o[k * 2] += (s * al) >> 12;
+                o[k * 2 + 1] += (s * ar) >> 12;
+                const uint32_t f = frac + step_frac;
+                index += step_index + (f < frac); // the carry
+                frac = f;
+                if (index >= end) {
+                    if (!v.looping) return;
+                    index = v.loop + (index - end) % (end - v.loop);
+                }
+            }
+            v.index = index;
+            v.frac = frac;
+            at += n;
+        }
+    }
+
     // NativeSampleMixer's peak limiter (immediate attack, 50 ms recovery,
     // one gain for both channels), then 16 bits.
     void limit(const int32_t *acc, int16_t *out, size_t count) {
-        const int32_t ceiling = int32_t(kCeiling * kOne);
+        limit(acc, out, count, limiter_, recovery_, int32_t(kCeiling * kOne));
+    }
+    static void limit(const int32_t *acc, int16_t *out, size_t count, float &limiter, float recovery,
+                      int32_t ceiling) {
         for (size_t f = 0; f < count; ++f) {
             int32_t l = acc[f * 2], r = acc[f * 2 + 1];
             const int32_t peak = std::max(std::abs(l), std::abs(r));
-            if (limiter_ < 1.0f || peak > ceiling) {
-                limiter_ += (1.0f - limiter_) * recovery_;
-                if (limiter_ >= 0.9999f) limiter_ = 1.0f;
-                if (peak > ceiling) limiter_ = std::min(limiter_, float(ceiling) / float(peak));
-                l = int32_t(float(l) * limiter_);
-                r = int32_t(float(r) * limiter_);
+            if (limiter < 1.0f || peak > ceiling) {
+                limiter += (1.0f - limiter) * recovery;
+                if (limiter >= 0.9999f) limiter = 1.0f;
+                if (peak > ceiling) limiter = std::min(limiter, float(ceiling) / float(peak));
+                l = int32_t(float(l) * limiter);
+                r = int32_t(float(r) * limiter);
             }
             out[f * 2] = int16_t(std::clamp(l, -32768, 32767));
             out[f * 2 + 1] = int16_t(std::clamp(r, -32768, 32767));
@@ -397,7 +578,10 @@ private:
     uint32_t rate_;
     snd::NativeSoundSequencer sequencer_;
     std::array<Voice, kVoices> voices_{};
-    std::array<int32_t, 512 * 2> acc_{};
+    std::array<int32_t, kChunk * 2> acc_{};
+    uint8_t *jobs_ = nullptr; // offload()
+    size_t job_capacity_ = 0, job_used_ = 0;
+    uint32_t batch_ = 1;
     std::unordered_map<uint32_t, Decoded> cache_;
     size_t cache_bytes_ = 0;
     uint64_t clock_ = 0, cursor_ = 0, end_ = 0;

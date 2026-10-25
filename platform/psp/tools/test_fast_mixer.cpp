@@ -3,6 +3,8 @@
 // (0xAE bank index, as the game sends them), the music bank (16) and the
 // effects bank (33). Prints the signal-to-error ratio of each and the time
 // each engine took. Your own ROM images (build-daytona/rom_cache/daytona).
+// Also the mixing as the Media Engine does it (offload: jobs written, then
+// run_jobs), which must give the fast engine's samples exactly.
 //
 // Built from the repository's root with
 //   c++ -std=c++20 -O2 -I src -I platform/psp/game platform/psp/tools/test_fast_mixer.cpp
@@ -18,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -33,7 +36,7 @@ std::vector<uint8_t> load(const std::string &path) {
     return {std::istreambuf_iterator<char>(f), {}};
 }
 
-struct Result { double snr_db, reference_rms, ms_reference, ms_fast; size_t streamed_differences; };
+struct Result { double snr_db, reference_rms, ms_reference, ms_fast; size_t streamed_differences, job_differences; };
 
 // `seconds` of sequence (bank, index), 512 frames a call, as the game would.
 // The PCM ROMs read through a reader (the PSP without its extra memory),
@@ -55,13 +58,19 @@ Result compare(const std::string &dir, uint8_t bank, uint8_t index, int seconds)
             return true;
         },
         48000, 256 * 1024);
+    psp::FastSoundEngine jobbed(program, pcm1, pcm2, 48000);
+    std::vector<uint8_t> jobs(256 * 1024);
+    auto state = std::make_unique<psp::FastSoundEngine::MixState>();
+    jobbed.init_mix_state(*state);
+    jobbed.offload(jobs.data(), jobs.size());
     const uint8_t start[] = {0xae, bank, index};
     reference.send(start, sizeof start);
     fast.send(start, sizeof start);
     streamed.send(start, sizeof start);
+    jobbed.send(start, sizeof start);
     std::vector<float> a(1024);
-    std::vector<int16_t> b(1024), c(1024);
-    size_t differences = 0;
+    std::vector<int16_t> b(1024), c(1024), d(1024);
+    size_t differences = 0, job_differences = 0;
     double signal = 0, error = 0, ms_a = 0, ms_b = 0;
     const size_t total = size_t(seconds) * 48000;
     for (size_t done = 0; done < total; done += 512) {
@@ -74,6 +83,10 @@ Result compare(const std::string &dir, uint8_t bank, uint8_t index, int seconds)
         ms_b += std::chrono::duration<double, std::milli>(t2 - t1).count();
         streamed.render(c.data(), 512);
         for (size_t i = 0; i < 1024; ++i) differences += b[i] != c[i];
+        jobbed.begin_batch();
+        jobbed.render(d.data(), 512);
+        psp::FastSoundEngine::run_jobs(jobs.data(), jobbed.job_bytes(), *state);
+        for (size_t i = 0; i < 1024; ++i) job_differences += b[i] != d[i];
         for (size_t i = 0; i < 1024; ++i) {
             const double r = a[i], f = b[i] / 32768.0;
             signal += r * r;
@@ -82,7 +95,7 @@ Result compare(const std::string &dir, uint8_t bank, uint8_t index, int seconds)
     }
     const double samples = double(total) * 2;
     return {error > 0 ? 10 * std::log10(signal / error) : 999.0, std::sqrt(signal / samples), ms_a, ms_b,
-            differences};
+            differences, job_differences + jobbed.job_overflows};
 }
 
 } // namespace
@@ -104,11 +117,12 @@ int main(int argc, char **argv) {
             continue;
         }
         ++played;
-        const bool ok = r.snr_db >= 30.0 && !r.streamed_differences;
+        const bool ok = r.snr_db >= 30.0 && !r.streamed_differences && !r.job_differences;
         failures += !ok;
-        std::printf("bank %2d index %2d: rms %.4f, signal/error %.1f dB, read through a reader: %zu samples differ %s\n",
-                    bank, index, r.reference_rms, r.snr_db, r.streamed_differences,
-                    ok ? "ok" : "FAIL (under 30 dB, or the reader's differ)");
+        std::printf("bank %2d index %2d: rms %.4f, signal/error %.1f dB, read through a reader: %zu samples differ, "
+                    "as jobs: %zu %s\n",
+                    bank, index, r.reference_rms, r.snr_db, r.streamed_differences, r.job_differences,
+                    ok ? "ok" : "FAIL (under 30 dB, or the reader's or the jobs' differ)");
     }
     std::printf("time: reference %.0f ms, fast %.0f ms (%.1fx)\n", ms_a, ms_b, ms_a / ms_b);
     if (!played) {

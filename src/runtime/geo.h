@@ -240,6 +240,9 @@ private:
     uint16_t float_to_zval(float floatval, int32_t z_adjust);
     bool check_culling(raster_state *raster, uint32_t attr, float min_z, float max_z);
     template <unsigned NumVerts> void model2_3d_process_polygon(raster_state *raster, uint32_t attr);
+#ifdef M2_PSP_FAST_GEO
+    template <unsigned NumVerts> void model2_3d_culled_polygon(raster_state *raster, uint32_t attr);
+#endif
     void model2_3d_push(raster_state *raster, uint32_t input);
     void model2_3d_push_point(raster_state *raster, const GeoVertex &point);
     void render_frame_start();

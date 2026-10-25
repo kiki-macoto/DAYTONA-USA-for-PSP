@@ -34,4 +34,12 @@ bool psp_st8(Env &e, uint32_t addr, uint8_t value, uint32_t ip, uint32_t n);
 bool psp_call(Env &e, uint32_t target, uint32_t sp, uint32_t ip, uint32_t n);
 bool psp_ret(Env &e, uint32_t ip, uint32_t n);
 
+// psp_gen.py's dual_modes: which version of a chunk runs (the fast one,
+// counting the lockstep down a basic block at a time, or the precise one,
+// an instruction at a time), whether the one that returned handed over (run
+// then calls the other at the same IP), and the count until the next event
+// it handed over (0: none).
+inline bool g_precise = false, g_handoff = false;
+inline uint32_t g_left = 0;
+
 } // namespace gen

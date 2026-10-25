@@ -222,12 +222,239 @@ def derive_n(text, name):
     return text
 
 
+# m2recomp's dispatch: by 128-byte block, then by IP.
+OUTER_SWITCH = re.compile(r"^    switch \(\(c\.m_IP - (0x[0-9a-f]+)u\) >> 7\) \{[^\n]*\n", re.M)
+PLAIN_SWITCH = re.compile(r"^    switch \(c\.m_IP\) \{\n", re.M)  # (a chunk whose IPs are far apart)
+DISPATCH_CASE = re.compile(r"case (0x[0-9a-f]+)u: goto (L_[0-9a-f]+);")
+
+
+def flat_dispatch(text, name):
+    """The dispatch as one switch on the IP's word from the chunk's base.
+    m2recomp's switch by block, then by IP, became compare trees (the inner
+    switches' cases are too sparse for -Os's jump tables): li, beq and sltiu
+    per case, a quarter of chunk_000's instructions, and GCC laid them out
+    among the instructions' own code, so the lines the instruction cache
+    held for a hot loop held some of them too. One table instead (in
+    .rodata), and the instructions' code in a run of their own. Where it
+    goes for an IP is unchanged: the same label, or return for an IP the
+    chunk has no code for."""
+    m = OUTER_SWITCH.search(text) or PLAIN_SWITCH.search(text)
+    if not m:
+        return text  # (the TGP's and the sound's code: not this dispatch)
+    end = text.index("\n    }\n", m.end()) + len("\n    }\n")
+    cases = []
+    for line in text[m.end():end].splitlines():
+        s = line.strip()
+        c = DISPATCH_CASE.fullmatch(s)
+        if c:
+            ip = int(c.group(1), 16)
+            if ip & 3 or c.group(2) != f"L_{ip:08x}":
+                sys.exit(f"psp_gen: {name}: dispatch case {s} not as expected")
+            cases.append(ip)
+        elif not (s in ("", "default: return;", "}") or s == "switch (c.m_IP) {" or re.fullmatch(r"case \d+u:", s)):
+            sys.exit(f"psp_gen: {name}: dispatch line not as expected: {s}")
+    if not cases or len(set(cases)) != len(cases):
+        sys.exit(f"psp_gen: {name}: no dispatch cases, or one twice")
+    # A table of the labels' addresses (GCC's labels as values), not a
+    # switch: GCC made the switch a compare tree again where most cases go
+    # to the same place (dual_modes' fast version), and laid it out among
+    # the instructions. One table per run of IPs (chunk_017's are in three
+    # places, megabytes apart).
+    cases.sort()
+    runs, start = [], 0
+    for i in range(1, len(cases) + 1):
+        if i == len(cases) or cases[i] - cases[i - 1] > 4096:
+            runs.append(cases[start:i])
+            start = i
+    flat = ["    // (psp_gen.py) a jump table on the IP's word for each run of IPs (flat_dispatch)\n"]
+    for r, run in enumerate(runs):
+        base, span = run[0], (run[-1] - run[0]) // 4 + 1
+        at = {(ip - base) >> 2: ip for ip in run}
+        table = "".join(f"            &&L_{at[i]:08x},\n" if i in at else "            &&no_code,\n" for i in range(span))
+        flat.append(f"    {{\n"
+                    f"        static const void *const kTable{r}[] = {{\n{table}        }};\n"
+                    f"        const uint32_t i_ = c.m_IP - 0x{base:08x}u;\n"
+                    f"        if (!(i_ & 3u) && i_ < {span * 4}u) goto *kTable{r}[i_ >> 2];\n"
+                    f"    }}\n")
+    flat.append("no_code: // (an IP this chunk has no code for)\n    return;\n")
+    return text[:m.start()] + "".join(flat) + text[end:]
+
+
+LABEL = re.compile(r"^L_([0-9a-f]{8}):")
+HEAD_A = re.compile(r"^    if \(__builtin_expect\(!--left, 0\)\) \{ x_off = \d+; goto x_exit_\d+; \}$")
+HEAD_B = "    if (__builtin_expect(!--left, 0)) goto recheck;"
+GOTO_LABEL = re.compile(r"goto (L_[0-9a-f]{8});")
+CASE_GOTO = re.compile(r"^(\s*case [^:]+: )goto (L_[0-9a-f]{8});$")
+TABLE_ENTRY = re.compile(r"^(\s*)&&(L_[0-9a-f]{8}),$")
+EVENT_MOVED = "{ n_c = n_c - left + 1; left = 1; }"  # (derive_n's: the next instruction checks in full)
+FAST_AFTER = 64  # the precise code hands back once this many instructions are left before the next event
+
+
+def dual_modes(text, name):
+    """Two versions of an i960 chunk: the precise one (chunk_NNN_p: the code
+    as it is, counting down `left` before every instruction) and a fast one
+    (chunk_NNN) that counts a basic block at once: at the block's first
+    instruction, if more instructions are left before the next lockstep
+    event than the block holds, all of them run and `left` drops by their
+    number; else the precise code takes over there, with that count, and
+    meets the event at its instruction, as before. The precise code hands
+    back once an event is behind it and more than FAST_AFTER are left. Each
+    instruction that calls the runtime, branches or touches `left` ends its
+    block, so within a block `left` means what it means in the precise code
+    wherever it is read. Entered at an IP that does not start a block (an
+    interrupt's return), the fast code hands over too. The same instructions
+    run, the events at the same counts: only the countdown's code moves, from
+    every instruction (three MIPS instructions and an exit) to every block.
+    gen_table.cpp's run (dual_table) calls the version the last one asked
+    for, again while one hands over."""
+    lines = text.split("\n")
+    try:
+        f0 = next(i for i, l in enumerate(lines) if re.match(r"^void chunk_\d+\(Env &e\) \{$", l))
+        f1 = max(i for i, l in enumerate(lines) if l == "}")
+        exits = next(i for i, l in enumerate(lines) if l.startswith("    // (psp_gen.py) the countdown's exits"))
+        disp = next(i for i in range(f0, f1) if lines[i] == "dispatch:")
+        resume = next(i for i in range(f0, f1) if lines[i] == "resume:")
+        first = next(i for i in range(f0, f1) if LABEL.match(lines[i]))
+    except StopIteration:
+        sys.exit(f"psp_gen: {name}: not the chunk layout dual_modes expects")
+    if lines[resume - 1] != "    n_c = left - 1;" or "    goto resume;" not in lines[disp:resume]:
+        sys.exit(f"psp_gen: {name}: recheck / dispatch not as dual_modes expects")
+    fn = re.match(r"^void (chunk_\d+)\(", lines[f0]).group(1)
+    handoff_in = ("    if (g_left) { left = g_left; g_left = 0; n_c = left - 1; goto resume; } "
+                  "// (psp_gen.py dual_modes) handed over with the count until the next event")
+
+    # The precise version: the code as it is, taking and handing over the count.
+    precise = lines[f0:f1 + 1]
+    precise[0] = precise[0].replace(f"void {fn}(", f"void {fn}_p(")
+    precise.insert(disp - f0, handoff_in)
+    r = resume - f0 + 1
+    precise.insert(r, f"    if (left > {FAST_AFTER}u) {{ g_left = left; g_precise = false; g_handoff = true; return; }} "
+                      "// (dual_modes) back to the fast code")
+
+    # The fast version: instructions, their blocks.
+    insns = []  # (ip, line indices)
+    for i in range(first, exits):
+        m = LABEL.match(lines[i])
+        if m:
+            insns.append((int(m.group(1), 16), [i]))
+        elif insns:
+            insns[-1][1].append(i)
+    targets = set(GOTO_LABEL.findall("\n".join(lines[first:exits])))
+    lo = min(ip for ip, _ in insns)
+    out = lines[f0:first]
+    heads, block_starts = set(), []
+    ends_block = True  # (the chunk's first instruction starts one)
+    bodies = []  # (ip, label line, body lines, a load or store through a helper only)
+    for ip, idx in insns:
+        body = []
+        for j in idx[1:]:
+            l = lines[j]
+            if HEAD_A.match(l) or l == HEAD_B:
+                continue
+            body.append(l)
+        head = ends_block or f"L_{ip:08x}" in targets
+        if head:
+            heads.add(ip)
+            block_starts.append(len(bodies))
+        joined = "\n".join(body)
+        # A load or store through a psp_ helper: it reads `left` only as
+        # n_c - left and, when the next event moved, sets left = 1. It stays
+        # inside its block: the count it reads is corrected by the block's
+        # instructions after it, and a moved event hands over to the precise
+        # code at the next instruction (below).
+        plain = joined.replace(EVENT_MOVED, "")
+        helper = ("left" in joined and plain.count("left") == plain.count("n_c - left") and
+                  not any(k in joined for k in ("goto ", "return", "c.m_IP", "dispatch")))
+        bodies.append((ip, idx[0], body, helper))
+        ends_block = not helper and any(k in joined for k in ("goto ", "return", "left", "c.m_IP", "dispatch"))
+    windows = set()
+    for b, start in enumerate(block_starts):
+        stop = block_starts[b + 1] if b + 1 < len(block_starts) else len(bodies)
+        k = stop - start
+        for n in range(start, stop):
+            ip, label, body, helper = bodies[n]
+            out.append(lines[label])
+            if n == start:
+                d = ip - lo
+                windows.add(d >> WINDOW_BITS)
+                out.append(f"    if (__builtin_expect(left <= {k}u, 0)) {{ x_off = {(d & ((1 << WINDOW_BITS) - 1)) >> 2}; "
+                           f"goto h_exit_{d >> WINDOW_BITS}; }} left -= {k}u;")
+            if helper:
+                # `left` as the precise code has it here: after this block's
+                # later instructions are added back.
+                after = stop - n - 1
+                true_left = f"(left + {after}u)" if after else "left"
+                if n + 1 >= len(bodies):
+                    sys.exit(f"psp_gen: {name}: a helper call ends the chunk")
+                moved = (f"{{ n_c = n_c - {true_left} + 1; left = 1; c.m_IP = 0x{bodies[n + 1][0]:08x}u; "
+                         f"goto to_precise; }}")
+                body = [l.replace(EVENT_MOVED, "\0").replace("n_c - left", f"n_c - {true_left}").replace("\0", moved)
+                        for l in body]
+            out.extend(body)
+    out.extend(lines[exits:f1])
+    out.extend(f"h_exit_{w}: c.m_IP = 0x{lo + (w << WINDOW_BITS):08x}u + uint32_t(x_off) * 4u; goto to_precise;"
+               for w in sorted(windows))
+    out += ["to_precise: // (dual_modes) the precise code from c.m_IP, with the count until the next event",
+            "    ls.count += n_c + 1 - left;",
+            "    ls.pending = 0;",
+            "    g_left = left;",
+            "    g_precise = true;",
+            "    g_handoff = true;",
+            "    return;",
+            "}"]
+    # The fast version's dispatch: the count taken at once (as the precise
+    # code's first instruction would take it), and the IPs that start no
+    # block to the precise code.
+    head_lines = out[:first - f0]
+    d = disp - f0
+    head_lines.insert(d, handoff_in)
+    k = next(i for i in range(d, len(head_lines)) if head_lines[i] == "    goto resume;")
+    head_lines[k] = "    left = 0; goto recheck; // (dual_modes) the count until the next event, taken here"
+    for i, l in enumerate(head_lines):
+        m = CASE_GOTO.match(l)
+        if m and int(m.group(2)[2:], 16) not in heads:
+            head_lines[i] = f"{m.group(1)}goto to_precise;"
+        m = TABLE_ENTRY.match(l)
+        if m and int(m.group(2)[2:], 16) not in heads:
+            head_lines[i] = f"{m.group(1)}&&to_precise,"
+    fast = head_lines + out[first - f0:]
+    return "\n".join(lines[:f0] + fast + [""] + precise + lines[f1 + 1:])
+
+
+def dual_table(text):
+    """gen_table.cpp for dual_modes: each chunk's precise version beside it,
+    and run calling the version asked for, again while one hands over."""
+    text = re.sub(r"^void (chunk_\d+)\(Env &\);$", r"void \1(Env &);\nvoid \1_p(Env &);", text, flags=re.M)
+    text = text.replace("struct Range { uint32_t first, last; void (*fn)(Env &); };",
+                        "struct Range { uint32_t first, last; void (*fn)(Env &), (*precise)(Env &); };")
+    text = re.sub(r"^(    \{0x[0-9a-f]+u, 0x[0-9a-f]+u, )(chunk_\d+)\},$", r"\1\2, \2_p},", text, flags=re.M)
+    old = "    if (r != std::begin(kChunks) && a <= (r - 1)->last) (r - 1)->fn(e);\n"
+    new = ("    if (r == std::begin(kChunks) || a > (r - 1)->last) return;\n"
+           "    // (psp_gen.py dual_modes) the fast or the precise version, as the\n"
+           "    // last asked; again while one hands over (the same IP, the same chunk).\n"
+           "    for (;;) {\n"
+           "        g_handoff = false;\n"
+           "        (g_precise ? (r - 1)->precise : (r - 1)->fn)(e);\n"
+           "        if (!g_handoff) return;\n"
+           "    }\n")
+    if old not in text or "(*precise)" not in text or "_p}," not in text:
+        sys.exit("psp_gen: gen_table.cpp not as dual_table expects")
+    text = text.replace(old, new)
+    return text.replace('#include "runtime/gen_support.h"\n',
+                        '#include "runtime/gen_support.h"\n#include "../platform/psp/game/gen_psp.h" // (psp_gen.py)\n', 1)
+
+
 def rewrite(text, name):
+    if name == "gen_table.cpp" and "struct Range" in text:
+        return dual_table(text)
+    text = flat_dispatch(text, name)
     text = memory_helpers(text)
     text = move_exits(text, name)
     for old, new in REWRITES:
         text = text.replace(old, new)
     text = derive_n(text, name)
+    if name.startswith("chunk_") and "recheck: // left ran out" in text:
+        text = dual_modes(text, name)
     return text
 
 

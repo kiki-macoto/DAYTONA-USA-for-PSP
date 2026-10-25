@@ -29,7 +29,7 @@ PPSSPP with every 2nd frame drawn, the arcade's 57.52 in the attract mode
 `tools/test_fast_mixer.cpp` (the PSP's sound mixer against the desktop's,
 with your ROM images) run on the PC; each says how to build it. On a
 PSP-3000 (ARK-5, 333 MHz) a race runs at about 23 ms a frame (the arcade's
-17.4), with 20 / 10 / 10 cars. Step-by-step build and install:
+17.4), with 10 cars on every course. Step-by-step build and install:
 [HOW_TO_COMPILE_PSP.md](../../HOW_TO_COMPILE_PSP.md). Details and the plan:
 [HANDOFF.md](HANDOFF.md).
 

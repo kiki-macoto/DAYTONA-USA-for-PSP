@@ -17,6 +17,205 @@
 - PPSSPP first, a console after. Speed and floating-point results from
   PPSSPP are stated as PPSSPP results.
 
+## Geometry: culled polygons apart; 10 cars on every course (2026-10-25)
+
+PROFILE geometry modes: Revision A's objects are all np_s (normals,
+specular). HW geometry (geo.cpp's hooks around a parse with objects): it
+is compute-bound (a busy frame: 5.5 M cycles, 1.2 M of them memory, 9 K
+instruction misses, 800 K FPU instructions for ~3,500 polygons handed
+over). model2_3d_culled_polygon (M2_PSP_FAST_GEO): a polygon geo_parse_np_s
+already knows check_culling culls by its first two tests skips
+model2_3d_process_polygon for exactly its side effects (rope, polygon z,
+texture addresses, linking); np_s reads the normal and the point in one
+GeoPtr::read. PPSSPP: frame dumps 3000/4500/6000 byte-identical, TRACE
+exact. Console (ARK-4 now really ~450 MHz: "measured about 452 MHz"): a
+light frame with objects 8.0 -> 6.4 ms; a busy one 12.3 ms (~16 expected
+before); totals 22.1 (light, 3.9 idle) and 22.9-25.0 ms (busy).
+
+The busy scenes' core (i960 + TGP, 16.6-17.2 ms) is the rest: the player
+chose 10 cars on every course (kCars beginner 20 -> 10; m2run on patched
+ROM images: POSITION /10, 10/10, the race as usual).
+
+## The TGP's registers in a local: tried, worse (2026-10-25)
+
+Tried: tgp.h's operations moved into an include shared by Tgp and a
+TgpLocal (the scalar registers copied into a local, the board side through
+references, I/O through Tgp's io_r / io_w), the generated run on `L.`
+instead of `t.`, the copy stored back before every return. TRACE exact,
+but tgpgen::run grew 132 -> 155 KB and its loads 5,100 -> 7,800: every one
+of the 2,024 instructions is a dispatch target (the TGP resumes where it
+stalled, and it jumps to computed addresses), so at every one the copy's
+fields must be where the others expect them: GCC put them on the stack and
+moved them at each. Taken out; tgp.h is as it was (no tgp_ops.inc).
+Registers would need fewer entries (an interpreter or a precise fallback
+for computed targets, as dual_modes does for the i960) first.
+
+Build note: going between PROFILE_TGP=1 and plain builds after a runtime
+header changed relinks objects built the other way (.SECONDARY; a flag
+change is not a change): the link then misses rt::g_tgp_profile_*. Touch
+the M2_PSP_PROFILE files (src/runtime/geo.cpp, m2_tgp_board.cpp) first.
+
+## The console with the new i960 code; the TGP tried (2026-10-23)
+
+Console, a busy race (553 TGP runs a frame): i960 instruction misses 75.8 K
+-> 59.8 K a frame, memory stalls 6.4 M -> 5.3 M cycles, core 28.9 -> 25.0
+ms, total 39.9 -> 36.5 ms. A light one (~200 runs): 30.0 -> 29.7. No
+problems seen; 8 MB the largest free block after construction.
+
+The TGP (HW TGP: ~25 K instruction misses a frame in a busy race): its
+count added a basic block at once (a block's length at its first
+instruction, an entry stub for a run resumed inside a block, a stall's
+return less the block's instructions from it on; TRACE exact) made
+tgpgen::run larger, 132 -> 141 KB: GCC already folded the per-instruction
+`++count` of straight runs, and the stubs and their branches were extra.
+Taken out. Its code is loads and stores of the Tgp's state (5,100 lw and
+3,700 sw of 35,000 instructions): the next thing to look at there is
+tgp.h's templates keeping that state in registers.
+
+## The i960 code: jump tables and two versions of each chunk (2026-10-23)
+
+chunk_000's MIPS, disassembled: m2recomp's dispatch (a switch by 128-byte
+block, then by IP) had become compare trees (li / beq / sltiu per case, a
+quarter of the function), and GCC had laid them out among the
+instructions' code. Two passes in scripts/psp_gen.py, the same instructions
+run and the events at the same counts (race_basic, race_expert and
+attract_long: TRACE as before):
+
+- **flat_dispatch**: one table of the labels' addresses per run of IPs
+  (GCC's labels as values: a switch became a compare tree again in the fast
+  version, where most cases go to the same place); chunk_017's IPs are in
+  three runs.
+- **dual_modes**: each chunk twice. chunk_NNN_p is the code as it was
+  (`left` counted down before every instruction); chunk_NNN counts a basic
+  block at once: at its first instruction, `if (left <= k) hand over` else
+  `left -= k`. A block ends at a jump target and after an instruction that
+  branches, returns, stores c.m_IP or calls the runtime other than through a
+  psp_ load/store helper; inside a block a helper reads `n_c - (left +
+  instructions after it)`, and a moved event hands over at the next
+  instruction. Handing over (to_precise; the precise code's recheck hands
+  back once more than 64 are left): g_left / g_precise / g_handoff
+  (gen_psp.h), and gen_table.cpp's run (dual_table) calls the version asked
+  for, again while one hands over. Entered at an IP that starts no block
+  (an interrupt's return), the fast code hands over.
+
+Text of the i960 code: 2.36 MB -> 1.60 MB for the fast versions (chunk_000
+85 -> 48 KB), 2.0 MB more for the precise ones (cold: run only up to an
+event); EBOOT.PBP 5.2 -> 7.4 MB (PPSSPP: largest free block 14 MB after
+construction). PPSSPP's time is the same (97 s); the console is the test.
+
+## The Media Engine re-weighed; --fast-inaccuracy tried (2026-10-23)
+
+**The Media Engine is worth it after all** (on by default again). The core
+depends mostly on the scene (TGP runs a frame): at 515-553 runs, without
+it core 25.9 + audio 5.5 (mixing 4.5) = 41.4 ms total; with it core 28.9 +
+audio 1.6 = 39.9. At 190-220 runs: 31.3 without, 30.0 with. The "5-11 ms
+slower" read before compared reports of different scenes.
+
+**Console geometry** (PSP-3000, the clock-read cost of 0.56 us a section
+taken off): a busy race frame with objects, 3,031 polygons, ~10 ms of
+model2_3d_process_polygon: vertices and culling ~5.7, clipping ~2.6,
+texture reads ~2.2, writing the polygon ~1.1. About 600 cycles a polygon in
+the simplest part: instruction misses rather than arithmetic.
+
+**--fast-inaccuracy** (build_psp.py, kept as an option; objects in
+build-daytona/psp_fi): the Vita's code (m2recomp --fast_inaccuracy with
+direct work RAM, m2tgprecomp --fast_inaccuracy). Not smaller: i960 2.49 MB
+of text against the exact rewrite's 2.36 MB (psp_gen.py's helpers already
+made it compact), the TGP 331 KB against 142 KB; PPSSPP 138 s against 143 s
+for race_basic with every frame drawn and dumped. Its race ran through:
+TGP counts and buffer hashes at 1500, 4500 and 6000 the exact build's, the
+i960 counts a few instructions off. Not sent to the console.
+
+## Where the geometry goes (2026-10-23)
+
+The player: the sound is right with the Media Engine now, the game still
+slow. PROFILE geometry (PROFILE_TGP=1; geo.cpp's g_geo_* under
+M2_PSP_PROFILE): parse on frames with objects / without, and
+model2_3d_process_polygon timed on 1 call in 16. PPSSPP, race_basic,
+every 4th frame drawn: 7-12 ms a frame with objects (2,200-3,800 polygons
+handed to the rasterizer, 1,100-1,800 kept), 6-7 tenths of it projecting
+and clipping; 0.2-0.3 ms a frame without (skip_objects works). At one
+frame in four that is 2.5-3 ms a frame on average: a third off the
+polygon path would save about 1 ms. The core (i960 + TGP, 11-14 ms on the
+console, about half of it memory stalls from 30 K instruction misses a
+frame) is the larger part. Console numbers for the split: asked for.
+
+## The Media Engine's first run on the console (2026-10-23)
+
+It started and mixed (audio on the game thread 1.0 / 1.4 ms, from 2.1-3.8),
+but the sound broke up (underruns 196 / 426, from 65) and the core slowed
+to 18.2 / 29.3 ms (from 11-13.5): memory stalls 6.5 M cycles a frame (from
+2.3 M). The engine's wait read the uncached seq back to back (a few nops
+between): the bus was kept busy. Now me::pause is ~8,000 cycles of a
+register count between reads. The underruns: its batch counted as written
+only at the next frame (one frame of the ring lost; frames of 30-40 ms):
+now the output thread plays it once done == seq (posted_end_), and the
+target is 5 blocks with the engine. Its CP0 Count read 0 (not counting on
+the engine): the mixing time is no longer printed.
+
+## The sound mixed on the Media Engine (2026-10-23)
+
+Console (ARK-4, clock left alone): total 25.0 / 21.9 / 24.2 ms in a race;
+mixing 1.4 / 2.5 / 3.1 ms a frame, all on the game thread. Now the Media
+Engine mixes (game/media_engine.h, audio.h's me_worker): started as
+mcidclan's psp-media-engine-custom-core starts it (MIT; THIRD_PARTY.md),
+through kubridge's kuKernelCall (the handler to 0xbfc00000, reset
+0xbc10004c 0x14 then 0), not its kernel module. The game thread still runs
+the sequencer and the voices' bookkeeping; FastSoundEngine::offload makes
+render() write a job per stretch between events (output pointer, frames,
+copies of the playing voices) and move the voices on without samples
+(advance: the envelope per block, the phase by n steps at once).
+run_jobs mixes them on the engine, block for block as mix() does:
+tools/test_fast_mixer.cpp's "as jobs" check, 0 samples differ on all 8
+sequences. A batch a frame (seq / done in an uncached MeLink); the next
+frame waits for it before its frames count (ring target 4 blocks, one
+more); samples a batch names are not evicted in that batch; the decoded
+samples and the jobs are written back for the engine; it invalidates its
+8 KB cache before a batch and writes it back after; the output thread
+reads the ring uncached. 44.1 kHz through sceAudioChReserve's plain
+channel with the engine (sceAudioSRC may use the system's Media Engine
+code, which the reset ends). Fallbacks: no answer in 200 ms at start
+(PPSSPP: does not run engine code), or a batch not done in 200 ms: the game
+thread mixes. settings.txt "me 0" turns it off; recorded runs (--inputs)
+never use it (race_basic TRACE 6000 unchanged). Log: "GAME Media Engine
+started" and "PROFILE Media Engine, ms per frame: mixing X (its CP0 Count
+as ms at the CPU clock), the game waiting Y". Not yet run on a console.
+
+## ARK-4's overclock and the clock left alone (2026-10-23)
+
+The player went back from ARK-5 to ARK-4 (final), with its overclock on.
+The draw change worked there (list 2.0 / 3.9 ms, from 3.3 / 9.0; draw
+cycles 2.2 M / 3.9 M, from 2.6 M / 6.9 M; uncached stores 6.6 K / 13 K,
+from 20 K / 54 K), but everything else ran 1.3-3x slower: core 20.7 / 25.7
+(from 12.2 / 17.9), mixing 2.9 / 4.7 (from 1.0 / 2.4, code unchanged), the
+CLOCK line's system calls 1.33x slower: about 250 MHz of real speed while
+scePower read 333. The game set 333 over it (scePowerSetClockFrequency even
+when the clock was already 333). Now set_cpu_clock leaves the clock alone
+when settings.txt asks nothing and it already reads 333 or more, and the
+log's first line ends with "measured about N MHz": 20 M taken branches
+with an add in the delay slot, timed, 2 cycles an iteration (PPSSPP: 322).
+Not yet run on the console.
+
+## The display list sent whole, vertices cached (2026-10-23)
+
+The console's draw (every drawn frame, before): 6.9 M cycles, 4.3 M of
+them memory stalls, 54 K uncached stores; "list" 3.3-9.0 ms. Two causes in
+PSPSDK's libpspgu (disassembled): in GU_DIRECT, sceGuDrawArray and
+sceGuGetMemory each call sceGeListUpdateStallAddr (a system call: two a
+polygon), and sceGuStart makes the list address uncached (| 0x40000000),
+so every vertex store went to memory. Now: the frame's list is built with
+sceGuStart(GU_SEND) and handed over by sceGuSendList(GU_TAIL) after
+sceGuFinish (the GE starts it then, not as it is written; GE wait was ~0),
+and the vertices go to `vertices_` (cached, 24,576 of them) written back
+once before the send. kListBytes 1.5 MB -> 512 KB (commands only).
+**GU_SEND's sceGuStart does not set the draw buffer** (GU_DIRECT's does,
+from sceGuSwapBuffers' state): without sceGuDrawBufferList at the list's
+start the GE drew into one buffer (a dumped frame came out black).
+PPSSPP: race_basic TRACE 6000 unchanged; frame dumps 3000, 4500, 6000
+byte-identical to before, 1500 differs in 11 pixels of the bottom row
+(slight shades: the layer's bilinear edge, not looked into). Not yet
+measured on a console.
+
 ## Overlay; the clock refused (2026-10-12, afternoon)
 
 **ARK-5 on the PSP-3000 refused 440 MHz**: sctrlHENSetSpeed(440, 220) left

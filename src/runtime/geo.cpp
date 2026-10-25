@@ -50,6 +50,49 @@ using u64 = uint64_t;
 #define M2_GEO_LOD(coef, dotp, lod) ((coef) * fabs(dotp) * (lod))
 #endif
 
+#ifdef M2_PSP_PROFILE
+// platform/psp's PROFILE geometry line (main.cpp): parse's time on frames
+// that parse objects and on those that skip them, the polygons handed to
+// model2_3d_process_polygon, and that function's time measured on 1 call in
+// 16 (the clock costs about 0.5 us a call: every call would add milliseconds).
+uint64_t (*g_geo_profile_clock)() = nullptr;
+// The CPU's counters around a parse with objects (main.cpp's HW geometry line).
+void (*g_geo_profile_enter)() = nullptr, (*g_geo_profile_leave)() = nullptr;
+uint64_t g_geo_parse_us[2] = {}, g_geo_parses[2] = {};
+uint64_t g_geo_polygon_calls = 0, g_geo_polygon_sampled_us = 0, g_geo_polygon_samples = 0;
+// The timed calls' time in parts: [0] the vertices and the culling, [1] the
+// texture point and header reads, [2] the clipping, [3] the polygon written
+// (a part's mark is taken when it ends; the rest of the call is [0]).
+uint64_t g_geo_section_us[4] = {};
+// Objects and their links (polygons) parsed, by mode (np_ns, np_s, nn_ns, nn_s).
+uint64_t g_geo_mode_objects[4] = {}, g_geo_mode_links[4] = {};
+namespace {
+struct PolygonTimer {
+    uint64_t t0 = 0, last = 0;
+    PolygonTimer() {
+        if (g_geo_profile_clock && (g_geo_polygon_calls++ & 15) == 0) t0 = last = g_geo_profile_clock();
+    }
+    void mark(int section) {
+        if (!t0) return;
+        const uint64_t now = g_geo_profile_clock();
+        g_geo_section_us[section] += now - last;
+        last = now;
+    }
+    ~PolygonTimer() {
+        if (t0) {
+            const uint64_t now = g_geo_profile_clock();
+            g_geo_section_us[0] += now - last;
+            g_geo_polygon_sampled_us += now - t0;
+            ++g_geo_polygon_samples;
+        }
+    }
+};
+} // namespace
+#define M2_GEO_MARK(section) timer.mark(section)
+#else
+#define M2_GEO_MARK(section) ((void)0)
+#endif
+
 struct quad_m2 {
     GeoVertex v[4];
     uint16_t z = 0;
@@ -325,6 +368,9 @@ inline bool Geo::check_culling(raster_state *raster, uint32_t attr, float min_z,
 template <unsigned NumVerts>
 void Geo::model2_3d_process_polygon(raster_state *raster, uint32_t attr)
 {
+#ifdef M2_PSP_PROFILE
+	PolygonTimer timer;
+#endif
 #ifdef M2_DC_SPEED
 	// Not zero-filled first (GeoVertex's initialisers, for every polygon):
 	// every field used below is written before it is read.
@@ -487,6 +533,7 @@ void Geo::model2_3d_process_polygon(raster_state *raster, uint32_t attr)
 #endif
 		GeoVertex *verts_in = vertices[0], *verts_out = vertices[1];
 
+		M2_GEO_MARK(0);
 #ifdef M2_DC_SPEED
 		// Only a polygon not culled reads its texture coordinates, texture
 		// header and LOD (nothing above uses them; tp and th are where they
@@ -504,6 +551,7 @@ void Geo::model2_3d_process_polygon(raster_state *raster, uint32_t attr)
 		object.texlod = ((raster->command_buffer[10] >> 8) & 0x7f80) - 0x3f80;
 		object.texlod += raster->log_ram[raster->command_buffer[10] & 0x7fff];
 #endif
+		M2_GEO_MARK(1);
 
 		for (int i = 0; i < NumVerts; i++)
 			verts_in[i] = object.v[i];
@@ -521,6 +569,7 @@ void Geo::model2_3d_process_polygon(raster_state *raster, uint32_t attr)
 			clipped_verts = clip_polygon(verts_in, clipped_verts, verts_out, clip_plane);
 			std::swap(verts_in, verts_out);
 		}
+		M2_GEO_MARK(2);
 
 		if (clipped_verts > 2)
 		{
@@ -569,6 +618,7 @@ void Geo::model2_3d_process_polygon(raster_state *raster, uint32_t attr)
 			if (object.z < raster->min_z) raster->min_z = object.z;
 			if (object.z > raster->max_z) raster->max_z = object.z;
 		}
+		M2_GEO_MARK(3);
 	}
 
 	/* update linking */
@@ -600,6 +650,75 @@ void Geo::model2_3d_process_polygon(raster_state *raster, uint32_t attr)
 		break;
 	}
 }
+
+#ifdef M2_PSP_FAST_GEO
+// platform/psp: a polygon check_culling culls by its first two tests
+// (single-sided and facing away, or link type 0), from geo_parse_np_s's
+// direct path: what model2_3d_process_polygon does for it, and nothing it
+// would not. The triangle's rope, the polygon z (from the same 24-bit
+// points, compared in the same order), the texture point and header
+// addresses moved on, the linking. No vertex extraction, texture setup or
+// call through the culling test. About half the polygons a race frame
+// hands over are these.
+template <unsigned NumVerts>
+void Geo::model2_3d_culled_polygon(raster_state *raster, uint32_t attr)
+{
+	uint32_t *const cb = raster->command_buffer;
+	if (NumVerts == 3)
+	{
+		cb[14] = cb[11];
+		cb[15] = cb[12];
+		cb[16] = cb[13];
+	}
+	float zvalue;
+	switch ((attr >> 10) & 3)
+	{
+		case 0: zvalue = raster->polygon_z; break;
+		case 1:
+		case 2:
+		{
+			// (process_polygon's v[0..3] z: P1(n-1), P0(n-1), P0(n), P1(n))
+			const float z0 = u2f(cb[7] << 8), z1 = u2f(cb[4] << 8), z2 = u2f(cb[13] << 8);
+			float min_z = z0, max_z = z0;
+			if (z1 < min_z) min_z = z1;
+			if (z2 < min_z) min_z = z2;
+			if (z1 > max_z) max_z = z1;
+			if (z2 > max_z) max_z = z2;
+			if (NumVerts == 4)
+			{
+				const float z3 = u2f(cb[16] << 8);
+				if (z3 < min_z) min_z = z3;
+				if (z3 > max_z) max_z = z3;
+			}
+			zvalue = ((attr >> 10) & 3) == 1 ? min_z : max_z;
+			break;
+		}
+		default: zvalue = 1e10; break;
+	}
+	raster->polygon_z = zvalue;
+	cb[0] += NumVerts * 2;
+	int32_t tho = (attr >> 12) & 0x1f;
+	if (tho & 0x10)
+		tho |= -16;
+	cb[1] += tho * 4;
+	switch ((attr >> 8) & 3)
+	{
+		case 0:
+		case 2:
+			for (uint32_t i = 0; i < 6; i++)
+				cb[2 + i] = cb[11 + i];
+			break;
+		case 1:
+			for (uint32_t i = 0; i < 3; i++)
+				cb[5 + i] = cb[11 + i];
+			break;
+		case 3:
+			for (uint32_t i = 0; i < 3; i++)
+				cb[2 + i] = cb[14 + i];
+			break;
+	}
+}
+#endif
 
 /***********************************************************************************************/
 
@@ -1062,8 +1181,20 @@ void Geo::geo_parse_np_s(geo_state *geo, GeoPtr input, uint32_t count)
 		/* push to the 3d rasterizer */
 		model2_3d_push(raster, attr & 0x0003ffff);
 
+#ifdef M2_PSP_FAST_GEO
+		// (The normal and the next point in one read: the same words. Not
+		// read after the last link, which nothing uses.)
+		if ((attr & 3) != 0)
+		{
+			uint32_t w[6];
+			input.read(w, 6);
+			normal.x = u2f(w[0]); normal.y = u2f(w[1]); normal.pz = u2f(w[2]);
+			point.x = u2f(w[3]); point.y = u2f(w[4]); point.pz = u2f(w[5]);
+		}
+#else
 		/* read in the normal */
 		read_point(input, normal);
+#endif
 
 		/* transform with the current matrix */
 		M2_GEO_VECTOR(&normal, geo);
@@ -1075,8 +1206,10 @@ void Geo::geo_parse_np_s(geo_state *geo, GeoPtr input, uint32_t count)
 			int32_t             luma;
 			texture_parameter * texparam;
 
+#ifndef M2_PSP_FAST_GEO
 			/* read in the next point */
 			read_point(input, point);
+#endif
 
 			/* transform with the current matrix */
 			M2_GEO_POINT(&point, geo);
@@ -1099,7 +1232,8 @@ void Geo::geo_parse_np_s(geo_state *geo, GeoPtr input, uint32_t count)
 			// (check_culling's first two tests: single-sided and facing away,
 			// or link type 0) needs no lighting: its luma word only the face
 			// bit, its LOD word nothing (neither is read for a culled one).
-			if (direct && ((((attr >> 17) & 1) == 0 && face != 0) || ((attr >> 8) & 3) == 0))
+			const bool culled = (((attr >> 17) & 1) == 0 && face != 0) || ((attr >> 8) & 3) == 0;
+			if (direct && culled)
 			{
 				luma = int32_t(face);
 				distance = 0;
@@ -1156,11 +1290,19 @@ void Geo::geo_parse_np_s(geo_state *geo, GeoPtr input, uint32_t count)
 					cb[15] = f2u(point.y) >> 8;
 					cb[16] = f2u(point.pz) >> 8;
 					raster->command_index = 17;
+#ifdef M2_PSP_FAST_GEO
+					if (culled) model2_3d_culled_polygon<4>(raster, cb[8]);
+					else
+#endif
 					model2_3d_process_polygon<4>(raster, cb[8]);
 				}
 				else
 				{
 					raster->command_index = 14;
+#ifdef M2_PSP_FAST_GEO
+					if (culled) model2_3d_culled_polygon<3>(raster, cb[8]);
+					else
+#endif
 					model2_3d_process_polygon<3>(raster, cb[8]);
 					input += 3; /* skip the next 3 points */
 				}
@@ -1651,6 +1793,10 @@ GeoPtr Geo::geo_object_data(geo_state *geo, uint32_t opcode, GeoPtr input)
 	if (obc == 0)
 		obc = 0xfffff;
 
+#ifdef M2_PSP_PROFILE
+	++g_geo_mode_objects[geo->mode & 3];
+	if (obc != 0xfffff) g_geo_mode_links[geo->mode & 3] += obc; // (not the run-to-the-end count)
+#endif
 	switch (geo->mode & 3)
 	{
 		/* Normals present, No Specular */
@@ -2247,6 +2393,25 @@ void Geo::parse(uint32_t read_start)
 	uint32_t  op_count = 0;
 	bool end_code = false;
 
+#ifdef M2_PSP_PROFILE
+	struct ParseTimer {
+		const bool objects;
+		const uint64_t t0;
+		~ParseTimer() {
+			if (objects && g_geo_profile_leave) g_geo_profile_leave();
+			if (!g_geo_profile_clock) return;
+			g_geo_parse_us[objects] += g_geo_profile_clock() - t0;
+			++g_geo_parses[objects];
+		}
+	} timer{
+#ifdef M2_DC_SPEED
+		!skip_objects,
+#else
+		true,
+#endif
+		g_geo_profile_clock ? g_geo_profile_clock() : 0};
+	if (timer.objects && g_geo_profile_enter) g_geo_profile_enter();
+#endif
 	// reset raster frame variables
 	render_frame_start();
 
